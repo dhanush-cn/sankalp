@@ -99,8 +99,11 @@ CREATE TABLE step_outputs (
 
 ```sql
 UPDATE workflows w
-SET status           = CASE WHEN w.status = 'COMPENSATING'
-                            THEN 'COMPENSATING' ELSE 'RUNNING' END,
+-- The ::workflow_status cast is required, not decoration. Both CASE branches are
+-- untyped literals, so the CASE resolves to text, and Postgres refuses to assign
+-- text to an enum column. Drop it and nothing claims at all.
+SET status           = (CASE WHEN w.status = 'COMPENSATING'
+                             THEN 'COMPENSATING' ELSE 'RUNNING' END)::workflow_status,
     owner_id         = $1,
     lease_expires_at = now() + ($2 || ' seconds')::interval,
     fencing_token    = w.fencing_token + 1,
