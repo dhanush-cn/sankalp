@@ -1,0 +1,5 @@
+# This repo was moved from Windows to WSL2. Normalise everything to LF in the
+# index and in the working tree so a CRLF file can never come back -- the
+# migration runner checksums .sql files, and a line-ending flip would otherwise
+# read as "this migration was edited after it was applied".
+* text=auto eol=lf

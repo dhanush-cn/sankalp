@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sankalp"
+version = "0.1.0"
+description = "Durable saga orchestrator for money movement"
+requires-python = ">=3.14"
+license = { text = "MIT" }
+
+# The dependency set is fixed by CLAUDE.md. The retry logic, queue, backoff,
+# circuit breaker and migrations are built in this repo on purpose -- do not add
+# Celery, SQLAlchemy, Alembic, or tenacity here.
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "asyncpg>=0.30",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "redis>=5.1",
+    "opentelemetry-api>=1.27",
+    "opentelemetry-sdk>=1.27",
+    "opentelemetry-exporter-otlp>=1.27",
+    "opentelemetry-instrumentation-fastapi>=0.48b0",
+    "opentelemetry-instrumentation-asyncpg>=0.48b0",
+    "opentelemetry-instrumentation-redis>=0.48b0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-repeat>=0.9",
+    "ruff>=0.9",
+]
+
+[project.scripts]
+sankalp-migrate = "sankalp.storage.migrate:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sankalp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# Function-scoped event loop: the crash tests run 20x and must not share loop
+# state between repetitions.
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-ra --strict-markers"
+markers = [
+    "slow: soak and chaos tests (1000 workflows, worker kills)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "ANN"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ANN"]
