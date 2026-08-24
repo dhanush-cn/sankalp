@@ -84,6 +84,12 @@ class Settings(BaseSettings):
         ge=2,
         description="Renew the lease every lease_duration / this while a step runs.",
     )
+    # On SIGTERM the worker stops claiming and lets in-flight workflows finish. This bounds
+    # that wait: a step still running afterwards is cancelled, and its workflow is recovered
+    # the ordinary way -- its lease expires and another worker resumes it from the last
+    # checkpoint. Keep it comfortably above a normal step so a rolling deploy does not
+    # routinely orphan work it could have finished in another second.
+    worker_shutdown_grace_seconds: float = Field(default=30.0, gt=0)
 
     # ---- Retry / backoff ----------------------------------------------------
     max_attempts: int = Field(default=5, ge=1)

@@ -48,6 +48,24 @@ class TerminalError(SankalpError):
     """
 
 
+class PreemptedError(SankalpError):
+    """This worker no longer owns the workflow it is executing.
+
+    Not a failure of the workflow, and deliberately outside the retry/compensate branch
+    above: the work is fine, *we* are stale. Some other worker legitimately re-claimed the
+    row -- because our lease expired while we were stalled -- and holds a higher fencing
+    token, so our ownership-guarded write matched zero rows.
+
+    The only correct response is to abandon the execution silently and write nothing
+    further. The new owner is already replaying from the last checkpoint, and any state we
+    wrote on the way out would be a second worker's opinion about a workflow it lost.
+
+    A step that catches this (a bare ``except Exception`` around ``ctx.renew_lease()``, say)
+    converts "I was preempted" into "the step failed" and gets the workflow compensated for
+    no reason. Let it propagate.
+    """
+
+
 class WorkflowDefinitionError(SankalpError):
     """A workflow or step is declared wrongly.
 

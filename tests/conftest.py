@@ -96,6 +96,23 @@ async def conn(connect: Callable[[], Awaitable[asyncpg.Connection]]) -> asyncpg.
 
 
 @pytest.fixture
+async def pool(test_dsn: str, truncate_tables: None) -> AsyncIterator[asyncpg.Pool]:
+    """A small pool on the test database -- what the executor and worker are handed.
+
+    Function-scoped like everything else here, because a pool binds its connections to the
+    event loop that created them and ``asyncio_default_fixture_loop_scope`` gives each test
+    a fresh one. Deliberately built with :func:`asyncpg.create_pool` rather than
+    ``storage.pool.create_pool``, which reads ``active_database_url`` -- the suite must point
+    at ``sankalp_test`` no matter what ``SANKALP_ENVIRONMENT`` says.
+    """
+    created = await asyncpg.create_pool(test_dsn, min_size=1, max_size=8)
+    try:
+        yield created
+    finally:
+        await created.close()
+
+
+@pytest.fixture
 def insert_workflow(conn: asyncpg.Connection) -> Callable[..., Awaitable[uuid.UUID]]:
     """Insert one workflow row and return its id.
 

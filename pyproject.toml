@@ -37,6 +37,7 @@ dev = [
 
 [project.scripts]
 sankalp-migrate = "sankalp.storage.migrate:main"
+sankalp-worker = "sankalp.engine.worker:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sankalp"]
