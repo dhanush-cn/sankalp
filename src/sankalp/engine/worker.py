@@ -19,10 +19,13 @@ executor's check before each step is the second one, and both drive the same
 
 **Shut down without stranding anything.** SIGTERM stops claiming and lets in-flight
 workflows finish, which is the difference between a rolling deploy that completes its work
-and one that leaves a lease-duration hole in throughput. A second signal, or the grace
-period running out, cancels what is left -- and cancelled work is not lost either, it is
-recovered by the same expired-lease path as a crash. That is the point of having only one
-recovery mechanism: the graceful path and the ``docker kill`` path end up in the same place.
+and one that leaves a lease-duration hole in throughput. A second signal, the grace period
+running out, or ``run()`` being cancelled outright cancels what is left -- that last one
+skips the waiting entirely, because a cancellation means stop *now* and honouring it with a
+grace period would make a supervisor wait out a delay it never asked for. Cancelled work is
+not lost either: it is recovered by the same expired-lease path as a crash. That is the
+point of having only one recovery mechanism -- the graceful path and the ``docker kill``
+path end up in the same place.
 """
 
 from __future__ import annotations
@@ -67,6 +70,9 @@ class Worker:
         self._in_flight: set[asyncio.Task[None]] = set()
         self._stopping = asyncio.Event()
         self._handled_signals: list[signal.Signals] = []
+        #: Set when run() is unwinding because it was cancelled, rather than because it was
+        #: asked to stop. The drain reads it to decide whether a grace period is owed.
+        self._cancelled = False
 
     # -- lifecycle ----------------------------------------------------------------------
 
@@ -100,6 +106,11 @@ class Worker:
         )
         try:
             await self._poll_forever()
+        except asyncio.CancelledError:
+            # Cancelled from outside rather than asked to stop. That is an order to stop
+            # *now*, so the drain below forgoes the grace period -- see _drain.
+            self._cancelled = True
+            raise
         finally:
             self._remove_signal_handlers()
             await self._drain()
@@ -254,11 +265,27 @@ class Worker:
     # -- shutdown -----------------------------------------------------------------------
 
     async def _drain(self) -> None:
+        """Let in-flight workflows finish, then cancel and collect whatever is left.
+
+        The grace period is owed to a *requested* shutdown -- SIGTERM, ``request_shutdown()``
+        -- where the caller is asking the worker to stop when it can. A cancellation is not
+        that: it says stop now, and sitting out the grace first would turn a supervisor's
+        ``task.cancel()`` into a wait of up to ``worker_shutdown_grace_seconds`` while this
+        worker politely finished work nobody asked it to finish.
+
+        Either way every task is cancelled and then **awaited**, never abandoned. That await
+        is what the executor's shielded checkpoint write depends on: it keeps a step that has
+        already run from losing its ``step_outputs`` row, and it holds off the pool close in
+        ``run_worker`` until the write has actually landed.
+        """
         if not self._in_flight:
             return
-        grace = self._settings.worker_shutdown_grace_seconds
+        grace = 0.0 if self._cancelled else self._settings.worker_shutdown_grace_seconds
         pending = set(self._in_flight)
-        log.info("draining %d in-flight workflow(s), up to %.0fs", len(pending), grace)
+        if self._cancelled:
+            log.info("cancelled: stopping %d in-flight workflow(s) now", len(pending))
+        else:
+            log.info("draining %d in-flight workflow(s), up to %.0fs", len(pending), grace)
 
         _, still_running = await asyncio.wait(pending, timeout=grace)
         if not still_running:
@@ -266,7 +293,7 @@ class Worker:
             return
 
         log.warning(
-            "%d workflow(s) still running after %.0fs; cancelling. Their leases expire in at "
+            "cancelling %d workflow(s) still running after %.1fs. Their leases expire in at "
             "most %ds and another worker resumes them from their last checkpoint",
             len(still_running),
             grace,
