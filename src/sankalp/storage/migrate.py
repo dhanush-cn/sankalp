@@ -284,7 +284,10 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         asyncio.run(run(target=args.target, directory=args.dir, dry_run=args.dry_run))
-    except (MigrationError, OSError, asyncpg.PostgresError) as exc:
+    # InterfaceError is a sibling of PostgresError, not a subclass, and asyncpg has no common
+    # base for the two -- without it a connection closed mid-run leaves the CLI printing a
+    # traceback instead of a diagnosable message and exit 1.
+    except (MigrationError, OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as exc:
         log.error("%s", exc)
         return 1
     return 0

@@ -26,6 +26,7 @@ from sankalp.engine.definition import StepContext, clear_registry, step, workflo
 from sankalp.engine.errors import RetryableError, TerminalError
 from sankalp.engine.executor import ExecutionResult, execute_workflow
 from sankalp.engine.lease import Lease
+from sankalp.storage import workflows as workflow_writes
 from sankalp.storage.queue import claim_workflows
 
 LEASE = 30
@@ -652,3 +653,127 @@ async def test_an_unregistered_workflow_type_leaves_the_row_untouched(
     assert final["status"] == "RUNNING"
     assert final["owner_id"] == "worker-a"
     assert final["error"] is None
+
+
+# ---------------------------------------------------------------------------
+# A COMPENSATING workflow must not be run forward. PHASE 1 ONLY -- these tests
+# change shape when Phase 2 wires a real compensator.
+#
+# The unwind is deliberately claimable with no backoff, and Phase 2 is what claims
+# it. Until then this worker is the only thing that ever picks such a row up, so
+# refusing it is the only thing standing between a failed saga and being replayed
+# forward on every claim.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_compensating_claim_is_deferred_without_running_any_step(
+    pool, insert_workflow, settings
+):
+    """The step that failed must not be invoked again just because the row was re-claimed.
+
+    Re-running it is a second side effect on a workflow that is already being unwound -- and
+    the step is being unwound precisely because it must not stand.
+    """
+    workflow_id = await insert_workflow(status="COMPENSATING")
+    calls: list[str] = []
+    define_transfer(calls)
+
+    result = await execute_workflow(pool, await claim_one(pool), settings=settings)
+
+    assert result is ExecutionResult.COMPENSATION_DEFERRED
+    assert calls == [], f"a COMPENSATING claim invoked {calls}; it must invoke nothing"
+
+    final = await row(pool, workflow_id)
+    assert final["status"] == "COMPENSATING", "the row must stay COMPENSATING, not move on"
+    assert final["owner_id"] is None, "ownership must be released so Phase 2 can claim it"
+    assert final["lease_expires_at"] is None
+    # Pushed into the future, which is what turns "immediately re-claimable" into a backoff
+    # instead of a worker spinning on this row for as long as Phase 2 does not exist.
+    assert final["run_after"] > await pool.fetchval("SELECT now()")
+
+
+async def test_a_step_that_recovers_cannot_promote_a_compensating_workflow_to_success(
+    pool, insert_workflow, settings
+):
+    """The dangerous one: fail terminally, then succeed on the next attempt.
+
+    Without the refusal the re-claim replays step 1 from its checkpoint, re-runs step 2 --
+    which now works -- runs step 3, and calls finish_success. The workflow reports SUCCESS
+    while the side effects it was unwinding were never unwound. Money moved and the row says
+    everything is fine.
+    """
+    workflow_id = await insert_workflow()
+    failure: list[Exception | None] = [TerminalError("rejected")]
+
+    @workflow(WORKFLOW_TYPE)
+    class Flaky:
+        @step(seq=1)
+        async def debit_wallet(self, ctx: StepContext) -> dict[str, bool]:
+            return {"debited": True}
+
+        @step(seq=2)
+        async def call_gateway(self, ctx: StepContext) -> dict[str, bool]:
+            if failure[0] is not None:
+                raise failure[0]
+            return {"charged": True}
+
+    # Attempt 1: terminal failure sends it to COMPENSATING, with step 1 checkpointed.
+    assert await execute_workflow(pool, await claim_one(pool), settings=settings) is (
+        ExecutionResult.COMPENSATING
+    )
+    assert (await row(pool, workflow_id))["status"] == "COMPENSATING"
+
+    # Attempt 2: the condition has cleared, so the step would now succeed.
+    failure[0] = None
+    result = await execute_workflow(pool, await claim_one(pool, owner="worker-b"),
+                                    settings=settings)
+
+    assert result is ExecutionResult.COMPENSATION_DEFERRED
+    final = await row(pool, workflow_id)
+    assert final["status"] == "COMPENSATING", (
+        f"status is {final['status']!r}: a workflow being unwound was promoted past its "
+        "compensation because a later attempt of the failing step happened to work."
+    )
+    assert "call_gateway" not in await checkpoints(pool, workflow_id)
+
+
+async def test_finish_success_refuses_a_workflow_that_is_not_running(pool, insert_workflow):
+    """The SQL guard on its own, independent of the executor branch above.
+
+    Two locks on the same door on purpose: the executor's check is a Python branch one edit
+    away from being lost, and this is the lock on the door itself.
+    """
+    workflow_id = await insert_workflow(status="COMPENSATING")
+    claimed = await claim_one(pool)
+    assert claimed.status == "COMPENSATING"
+
+    own = workflow_writes.Ownership.of(claimed)
+    assert await workflow_writes.finish_success(pool, own, output_json="{}") is False
+    assert (await row(pool, workflow_id))["status"] == "COMPENSATING"
+
+
+async def test_defer_compensation_is_ownership_guarded(pool, insert_workflow):
+    """False means preempted, and nothing is written -- the rule every write here follows."""
+    workflow_id = await insert_workflow(status="COMPENSATING")
+    claimed = await claim_one(pool)
+    own = workflow_writes.Ownership.of(claimed)
+
+    await steal(pool, workflow_id)
+
+    assert await workflow_writes.defer_compensation(pool, own, delay_seconds=30) is False
+    stolen = await row(pool, workflow_id)
+    assert stolen["owner_id"] == "worker-b", "the stale worker released someone else's row"
+    assert stolen["run_after"] <= await pool.fetchval("SELECT now()")
+
+
+async def test_defer_compensation_refuses_a_workflow_that_is_no_longer_compensating(
+    pool, insert_workflow
+):
+    """The status predicate is part of the guard: a row that moved on is not ours to defer."""
+    workflow_id = await insert_workflow()
+    claimed = await claim_one(pool)
+    assert claimed.status == "RUNNING"
+
+    own = workflow_writes.Ownership.of(claimed)
+    assert await workflow_writes.defer_compensation(pool, own, delay_seconds=30) is False
+    assert (await row(pool, workflow_id))["owner_id"] == "worker-a"

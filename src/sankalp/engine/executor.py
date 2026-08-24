@@ -34,6 +34,14 @@ twice or gets stranded (src/sankalp/engine/errors.py):
 Note which way the default points. An exception the step did not classify is treated as
 terminal, because an unrecognised failure is not evidence that re-running the step is safe,
 while compensation is idempotent by contract.
+
+Until Phase 2 exists, "unwound by Phase 2" needs one more thing to be true: a Phase 1 worker
+that claims a COMPENSATING row must refuse it rather than run it forward. Nothing in the
+schema stops it claiming one -- an unwind is deliberately claimable with no backoff -- so the
+refusal lives here, at the top of :func:`execute_workflow`, ahead of any step invocation.
+Without it a failed workflow is re-executed forward on every claim, and one whose step
+happens to succeed on a later attempt is carried to SUCCESS with its committed side effects
+never unwound.
 """
 
 from __future__ import annotations
@@ -78,6 +86,10 @@ class ExecutionResult(StrEnum):
     RETRY_SCHEDULED = "RETRY_SCHEDULED"
     COMPENSATING = "COMPENSATING"
     PREEMPTED = "PREEMPTED"
+    #: Claimed a workflow that needs unwinding, in a build with nothing to unwind it. Like
+    #: PREEMPTED, this names what this *worker* did, not a state the row is in -- the row is
+    #: COMPENSATING before and after. Phase 2 removes it.
+    COMPENSATION_DEFERRED = "COMPENSATION_DEFERRED"
 
 
 async def execute_workflow(
@@ -99,6 +111,22 @@ async def execute_workflow(
     transition for "this process could not run it" would be a lie about the workflow.
     """
     settings = settings or get_settings()
+
+    # PHASE 1 ONLY -- delete this branch when Phase 2 wires the compensator, and delete
+    # storage.workflows.defer_compensation with it.
+    #
+    # A COMPENSATING row is claimable by the same dequeue query as everything else (that is
+    # deliberate: an unwind must not sit out a backoff). Phase 2 owns the unwind, and until it
+    # exists this worker is the only thing that ever picks such a row up -- so without this
+    # branch it would walk the FORWARD loop again. That re-invokes the step that failed, and a
+    # step which fails once and then succeeds would carry the workflow all the way to SUCCESS
+    # with its earlier side effects never unwound.
+    #
+    # Checked before get_definition on purpose, so a COMPENSATING row whose type this build
+    # does not import also defers cleanly rather than raising and spinning on its lease.
+    if claimed.status == "COMPENSATING":
+        return await _defer_compensation(conn_pool, claimed, settings=settings)
+
     # Deliberately outside the try below: an unknown workflow_type means this build does not
     # import the definition, which is a deployment fact about *us*, not a failure of the
     # workflow. Compensating it here would unwind real money because a worker was stale.
@@ -180,6 +208,42 @@ async def execute_workflow(
         return await _handle_step_failure(
             conn_pool, claimed, own, step=running, exc=exc, settings=settings
         )
+
+
+async def _defer_compensation(
+    conn_pool: asyncpg.Pool,
+    claimed: ClaimedWorkflow,
+    *,
+    settings: Settings,
+) -> ExecutionResult:
+    """Give a COMPENSATING workflow back to the queue, later. PHASE 1 ONLY.
+
+    WARNING rather than DEBUG, and naming the reason, because a deferred workflow and a stuck
+    one look identical from the outside -- COMPENSATING, unowned, going nowhere. Whoever finds
+    such a row at 3am should learn why from the logs, not have to infer it from the absence of
+    a compensator.
+
+    Reuses :func:`compute_backoff` rather than a fixed delay so repeated deferrals spread out
+    with the same jitter as everything else; a fixed one would sync every deferred workflow in
+    the system onto the same tick.
+    """
+    delay = compute_backoff(claimed.attempt, cap_seconds=settings.backoff_cap_seconds)
+    log.warning(
+        "COMPENSATING workflow %s (%s) claimed by a Phase-1 worker with no compensator; "
+        "deferring for %.1fs until Phase 2 wires the unwind (attempt %d)",
+        claimed.id,
+        claimed.workflow_type,
+        delay,
+        claimed.attempt,
+    )
+    if not await workflow_writes.defer_compensation(
+        conn_pool, workflow_writes.Ownership.of(claimed), delay_seconds=delay
+    ):
+        log.warning(
+            "workflow %s was re-claimed before its compensation could be deferred", claimed.id
+        )
+        return ExecutionResult.PREEMPTED
+    return ExecutionResult.COMPENSATION_DEFERRED
 
 
 def _context_for(

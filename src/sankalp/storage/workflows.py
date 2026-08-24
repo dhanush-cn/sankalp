@@ -45,6 +45,7 @@ __all__ = [
     "finish_success",
     "schedule_retry",
     "begin_compensation",
+    "defer_compensation",
     "renew_lease",
 ]
 
@@ -147,6 +148,14 @@ INSERT INTO step_outputs (workflow_id, step_name, seq, kind, output, started_at,
 VALUES ($1, $2, $3, 'FORWARD', $4::jsonb, now() - make_interval(secs => $5::float8), now())
 """
 
+#: ``AND status = 'RUNNING'`` is a guard, not a filter. Only a forward run reaches SUCCESS,
+#: and a forward run is RUNNING by definition -- so the predicate costs nothing on the happy
+#: path and makes one specific catastrophe unrepresentable: a COMPENSATING workflow being
+#: promoted to SUCCESS. That transition would mark a saga complete while the forward steps it
+#: was unwinding stay un-unwound, i.e. money moved and the row says everything is fine.
+#: The executor also refuses to run a COMPENSATING claim forward, which means this predicate
+#: should never be the thing that fires. Keep both: that check is a Python branch one edit
+#: away from being lost, and this is the lock on the door itself.
 _FINISH_SUCCESS_SQL = """
 UPDATE workflows
 SET status           = 'SUCCESS',
@@ -155,7 +164,7 @@ SET status           = 'SUCCESS',
     owner_id         = NULL,
     lease_expires_at = NULL,
     updated_at       = now()
-WHERE id = $1 AND owner_id = $3 AND fencing_token = $4
+WHERE id = $1 AND owner_id = $3 AND fencing_token = $4 AND status = 'RUNNING'
 """
 
 #: Back to PENDING with the lease released and ``run_after`` pushed out by the backoff.
@@ -184,6 +193,25 @@ SET status           = 'COMPENSATING',
     run_after        = now(),
     updated_at       = now()
 WHERE id = $1 AND owner_id = $3 AND fencing_token = $4
+"""
+
+#: Put a COMPENSATING workflow back on the queue, later, without changing what it is.
+#:
+#: ``status`` is pointedly absent from the SET list. The row is COMPENSATING and stays
+#: COMPENSATING -- this releases ownership and pushes ``run_after`` out, nothing more. The
+#: alternative would be a seventh status meaning "waiting for a compensator that does not
+#: exist yet", and the six are exactly six on purpose.
+#:
+#: ``AND status = 'COMPENSATING'`` is part of the ownership guard rather than decoration: it
+#: makes the statement unable to touch a row that has moved on since it was claimed.
+_DEFER_COMPENSATION_SQL = """
+UPDATE workflows
+SET owner_id         = NULL,
+    lease_expires_at = NULL,
+    run_after        = now() + make_interval(secs => $2::float8),
+    updated_at       = now()
+WHERE id = $1 AND owner_id = $3 AND fencing_token = $4
+  AND status = 'COMPENSATING'
 """
 
 _RENEW_LEASE_SQL = """
@@ -267,6 +295,34 @@ async def begin_compensation(pool: asyncpg.Pool, own: Ownership, *, error: str) 
     """Hand the workflow to the unwind: COMPENSATING, lease released, immediately claimable."""
     tag = await pool.execute(
         _BEGIN_COMPENSATION_SQL, own.workflow_id, error, own.owner_id, own.fencing_token
+    )
+    return rows_affected(tag) > 0
+
+
+async def defer_compensation(
+    pool: asyncpg.Pool, own: Ownership, *, delay_seconds: float
+) -> bool:
+    """Release a COMPENSATING workflow back to the queue after ``delay_seconds``.
+
+    For a worker that claimed an unwind it has no compensator for. It leaves the status, the
+    checkpoints and the error exactly as they are and only gives the row back -- the workflow
+    is not progressing, and pretending otherwise by writing a state would be a lie about it.
+
+    The delay is what keeps this from becoming a busy loop: ``begin_compensation`` sets
+    ``run_after = now()`` so an unwind never sits out a backoff, which is right once something
+    can actually unwind it and merely means "immediately re-claimable" until then.
+
+    Returns False if the ownership guard matched zero rows, or if the workflow is no longer
+    COMPENSATING -- either way somebody else has it and this worker must drop the work.
+
+    Phase 2 deletes this along with the executor branch that calls it.
+    """
+    tag = await pool.execute(
+        _DEFER_COMPENSATION_SQL,
+        own.workflow_id,
+        delay_seconds,
+        own.owner_id,
+        own.fencing_token,
     )
     return rows_affected(tag) > 0
 

@@ -127,9 +127,17 @@ class Worker:
 
             try:
                 claimed = await self._claim(slots)
-            except (asyncpg.PostgresError, OSError):
+            except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError):
                 # The database is unreachable or unhappy. Nothing was claimed, so nothing is
                 # stranded; back off for a poll interval and try again rather than spinning.
+                #
+                # InterfaceError is named explicitly because it is NOT a PostgresError --
+                # asyncpg gives the two separate hierarchies whose only common base is
+                # Exception, so `except asyncpg.PostgresError` catches none of the
+                # connection-level failures (a server-closed pooled connection, a rolling
+                # restart, a pgbouncer reset). Uncaught here, one of those escapes
+                # _poll_forever and run() and kills the whole worker process. There is no
+                # asyncpg.Error to catch instead; the tuple has to name both.
                 log.exception("claim failed; retrying after the poll interval")
                 self._release_slots(slots)
                 await self._wait(self._settings.poll_interval_seconds)
@@ -196,9 +204,20 @@ class Worker:
             )
         finally:
             renewer.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await renewer
-            self._slots.release()
+            # The release is in its own finally, and that nesting is load-bearing. Awaiting a
+            # task that died with anything other than CancelledError re-raises that exception
+            # here, past the suppress -- so a flat sequence would skip the release and this
+            # worker would be permanently one slot poorer. Enough of those and the semaphore
+            # reaches zero, _acquire_slots blocks forever, and the worker stops claiming while
+            # its process stays alive and every liveness probe still passes. The renewer's
+            # except below is deliberately broad for the same reason; this is the second line
+            # of defence, so that a future exception source in there cannot silently shrink
+            # this worker's capacity.
+            try:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await renewer
+            finally:
+                self._slots.release()
 
     async def _renew_until_done(self, lease: Lease) -> None:
         """Extend one workflow's lease on a timer until cancelled or preempted.
@@ -221,9 +240,16 @@ class Worker:
                         lease.fencing_token,
                     )
                     return
-            except (asyncpg.PostgresError, OSError):
+            except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError):
                 # A blip must not kill the renewer -- that would guarantee the loss it is
                 # trying to prevent. Try again next tick; there is still lease left.
+                #
+                # InterfaceError belongs in this tuple and is easy to drop by mistake: it is a
+                # sibling of PostgresError under Exception, not a subclass, and there is no
+                # asyncpg.Error covering both. It is also the likeliest blip of all here --
+                # this runs on a timer for the whole life of every workflow, so it meets every
+                # recycled connection the pool ever hands out. Left uncaught it kills the
+                # renewer task, and _run_one then leaks this workflow's concurrency slot.
                 log.warning(
                     "lease renewal for workflow %s failed; retrying in %.1fs",
                     lease.workflow_id,

@@ -25,6 +25,7 @@ import signal
 import time
 import uuid
 
+import asyncpg
 import pytest
 
 from sankalp.config import Settings
@@ -404,3 +405,217 @@ async def test_the_renewer_keeps_a_step_that_outlives_its_lease(pool, insert_wor
     final = await pool.fetchrow("SELECT * FROM workflows WHERE id = $1", workflow_id)
     assert final["status"] == "SUCCESS"
     assert final["attempt"] == 1, "the workflow was re-claimed, so a renewal was missed"
+
+
+# ---------------------------------------------------------------------------
+# 5. Connection-level failures must not quietly disable the worker.
+#
+# asyncpg splits its errors into two hierarchies whose only common base is Exception:
+# PostgresError (the server said no) and InterfaceError (the connection did). There is no
+# asyncpg.Error covering both, so `except asyncpg.PostgresError` catches none of the ordinary
+# operational events -- a server-closed pooled connection, a rolling restart, a pgbouncer
+# reset. These tests cover the two ways that bites, which fail differently: one kills the
+# worker outright, the other shrinks it to nothing while its process stays alive.
+# ---------------------------------------------------------------------------
+
+#: Unique to _RENEW_LEASE_SQL and _CLAIM_SQL respectively. Matching the statement rather than
+#: counting calls keeps these from breaking when an unrelated query is added.
+_RENEW_FRAGMENT = "SET lease_expires_at = now() + make_interval"
+_CLAIM_FRAGMENT = "FOR UPDATE SKIP LOCKED"
+
+
+class FaultyPool:
+    """A real pool that fails one specific statement, the way a dead connection does.
+
+    Delegates everything it does not intercept, so the worker, the lease and the executor all
+    run their real code paths against a real database. Only the chosen statement is made to
+    raise, and with the exception asyncpg would actually raise for a connection that went away.
+
+    ``times`` bounds the failures so a test can prove the worker *recovers* rather than merely
+    survives; left None the statement fails for the whole run.
+    """
+
+    def __init__(self, pool, *, fragment: str, error: BaseException, times: int | None = None):
+        self._pool = pool
+        self._fragment = fragment
+        self._error = error
+        self._remaining = times
+        self.hits = 0
+
+    def __getattr__(self, name):
+        return getattr(self._pool, name)
+
+    def should_fail(self, query: str) -> bool:
+        if self._fragment not in query:
+            return False
+        if self._remaining is not None:
+            if self._remaining <= 0:
+                return False
+            self._remaining -= 1
+        self.hits += 1
+        return True
+
+    @property
+    def error(self) -> BaseException:
+        return self._error
+
+    async def execute(self, query, *args, **kwargs):
+        if self.should_fail(query):
+            raise self._error
+        return await self._pool.execute(query, *args, **kwargs)
+
+    def acquire(self, *args, **kwargs):
+        return _FaultyAcquire(self._pool, self)
+
+
+class _FaultyAcquire:
+    """``pool.acquire()`` yielding a connection whose reads can be made to fail."""
+
+    def __init__(self, pool, faulty: FaultyPool):
+        self._ctx = pool.acquire()
+        self._faulty = faulty
+
+    async def __aenter__(self):
+        return _FaultyConnection(await self._ctx.__aenter__(), self._faulty)
+
+    async def __aexit__(self, *exc_info):
+        return await self._ctx.__aexit__(*exc_info)
+
+
+class _FaultyConnection:
+    def __init__(self, conn, faulty: FaultyPool):
+        self._conn = conn
+        self._faulty = faulty
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    async def fetch(self, query, *args, **kwargs):
+        if self._faulty.should_fail(query):
+            raise self._faulty.error
+        return await self._conn.fetch(query, *args, **kwargs)
+
+
+async def test_a_connection_level_renewal_failure_does_not_kill_the_renewer(
+    pool, insert_workflow
+):
+    """An InterfaceError on renewal must be survivable -- it is the likeliest blip of all.
+
+    The renewer runs on a timer for the whole life of every workflow, so it meets every
+    recycled connection the pool ever hands out. Asserting the *count* of renewal attempts is
+    the point: a renewer that died on the first failure would leave this workflow succeeding
+    anyway, so only the retries distinguish "survived" from "quietly stopped".
+    """
+
+    @workflow(WORKFLOW_TYPE)
+    class Slow:
+        @step(seq=1)
+        async def debit_wallet(self, ctx: StepContext) -> dict[str, bool]:
+            await asyncio.sleep(1.0)
+            return {"debited": True}
+
+    await insert_workflow()
+    faulty = FaultyPool(
+        pool,
+        fragment=_RENEW_FRAGMENT,
+        error=asyncpg.InterfaceError("connection is closed"),
+    )
+    worker = Worker(
+        faulty,
+        settings=make_settings(lease_duration_seconds=1, lease_renew_divisor=3),
+        owner_id="worker-a",
+    )
+    task = asyncio.create_task(worker.run())
+    try:
+        assert await wait_for(lambda: _all_success(pool), give_up_after=15), (
+            f"workflow did not finish: {await statuses(pool)}"
+        )
+    finally:
+        await stop(worker, task)
+
+    assert faulty.hits >= 2, (
+        f"only {faulty.hits} renewal attempt(s) against a lease renewing every ~0.33s for a "
+        "~1s step. The renewer died on the first InterfaceError instead of retrying next tick."
+    )
+
+
+async def test_a_dying_renewer_does_not_leak_a_concurrency_slot(pool, insert_workflow):
+    """A renewer that dies must still give its workflow's slot back.
+
+    Structural, and independent of which exceptions the renewer catches: awaiting a task that
+    died with anything other than CancelledError re-raises it in ``_run_one``'s finally, past
+    the suppress. If the release is not itself in a finally it is skipped, the semaphore
+    ratchets down, and at zero the worker stops claiming while its process stays alive and
+    every liveness probe still passes.
+
+    ``worker_concurrency=1`` makes one leaked permit immediately fatal and visible: the second
+    workflow is simply never claimed.
+    """
+
+    @workflow(WORKFLOW_TYPE)
+    class Slow:
+        @step(seq=1)
+        async def debit_wallet(self, ctx: StepContext) -> dict[str, bool]:
+            await asyncio.sleep(0.5)
+            return {"debited": True}
+
+    for _ in range(2):
+        await insert_workflow()
+
+    # ValueError deliberately: it is in none of the renewer's except tuples however they are
+    # widened, so this proves the finally rather than the catch. The two fixes are separate,
+    # and this test must stay red if only the finally is reverted.
+    faulty = FaultyPool(pool, fragment=_RENEW_FRAGMENT, error=ValueError("renewer blew up"))
+    worker = Worker(
+        faulty,
+        settings=make_settings(
+            worker_concurrency=1, lease_duration_seconds=1, lease_renew_divisor=3
+        ),
+        owner_id="worker-a",
+    )
+    task = asyncio.create_task(worker.run())
+    try:
+        drained = await wait_for(lambda: _all_success(pool), give_up_after=15)
+    finally:
+        await stop(worker, task)
+
+    assert drained, (
+        f"the queue did not drain: {await statuses(pool)}. With worker_concurrency=1 a single "
+        "leaked permit means the worker never claims again -- _acquire_slots blocks forever on "
+        "a semaphore nothing will release."
+    )
+
+
+async def test_a_connection_level_claim_failure_does_not_kill_the_worker(pool, insert_workflow):
+    """An InterfaceError while claiming must back off, not take the process down.
+
+    Uncaught it escapes _poll_forever, then run(), then run_worker() -- so one recycled
+    connection ends the worker. Nothing was claimed when it fires, so nothing is stranded and
+    retrying after a poll interval is the whole correct response.
+    """
+
+    @workflow(WORKFLOW_TYPE)
+    class Transfer:
+        @step(seq=1)
+        async def debit_wallet(self, ctx: StepContext) -> dict[str, bool]:
+            return {"debited": True}
+
+    await insert_workflow()
+    faulty = FaultyPool(
+        pool,
+        fragment=_CLAIM_FRAGMENT,
+        error=asyncpg.InterfaceError("connection is closed"),
+        times=3,
+    )
+    worker = Worker(faulty, settings=make_settings(), owner_id="worker-a")
+    task = asyncio.create_task(worker.run())
+    try:
+        drained = await wait_for(lambda: _all_success(pool), give_up_after=15)
+    finally:
+        await stop(worker, task)
+
+    assert faulty.hits == 3, f"the claim was made to fail 3 times, it failed {faulty.hits}"
+    assert drained, (
+        f"the queue did not drain: {await statuses(pool)}. The worker died on a connection-"
+        "level claim failure instead of backing off and claiming again."
+    )
