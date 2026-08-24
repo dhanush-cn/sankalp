@@ -29,7 +29,23 @@ from sankalp.config import get_settings
 #: tables are listed for the same reason. side_effects in particular MUST start empty in
 #: every repetition: the gate asserts exact row counts, so a leftover row from the previous
 #: run of tests/test_crash.py would read as a double-executed side effect.
-_TABLES = ("workflows", "step_outputs", "side_effects", "step_attempts", "crash_gates")
+#:
+#: outbox and ledger_entries (003_saga.sql) are listed on the same principle. Both use
+#: BIGSERIAL, so RESTART IDENTITY matters to them: a drain test that asserts on outbox ids
+#: wants them to start at 1 in every repetition. ledger_entries is the one table here that
+#: cannot be emptied any other way -- its append-only trigger rejects DELETE unconditionally
+#: -- but the trigger is BEFORE UPDATE OR DELETE only, and TRUNCATE is a separate event it
+#: does not fire on. That is deliberate and documented in the migration; this fixture is the
+#: reason. See tests/test_ledger.py::test_truncate_is_deliberately_not_blocked.
+_TABLES = (
+    "workflows",
+    "step_outputs",
+    "side_effects",
+    "step_attempts",
+    "crash_gates",
+    "outbox",
+    "ledger_entries",
+)
 
 
 @pytest.fixture(scope="session")

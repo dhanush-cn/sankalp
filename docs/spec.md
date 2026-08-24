@@ -415,6 +415,30 @@ CREATE TABLE workers (
 
 Rate limiter state lives in Redis only — no Postgres table. Deliberate: it's ephemeral, high-churn, and losing it on restart is harmless (you fail open).
 
+## Restricted Application Role
+
+**Status: not built.** Everything — API, workers, migration runner, pytest — connects as `sankalp`, which is `POSTGRES_USER` in `docker-compose.yml`: a superuser, and the owner of both databases. `migrations/003_saga.sql` points its TRUNCATE note here, so this is the task it points at.
+
+The consequence to be honest about: `ledger_entries` is append-only against `UPDATE` and `DELETE` — a statement-level trigger enforces that, and it has no bypass — but **TRUNCATE is not covered and currently nothing else covers it either.** The trigger deliberately excludes TRUNCATE so `tests/conftest.py` can empty the table between tests. A superuser bypasses privilege checks outright and a table's owner may TRUNCATE regardless of what has been revoked, so today's single role has no control on it at all.
+
+The fix is a grant, not another trigger:
+
+```sql
+CREATE ROLE sankalp_app LOGIN PASSWORD '...';   -- NOT a superuser, NOT the table owner
+GRANT CONNECT ON DATABASE sankalp TO sankalp_app;
+GRANT USAGE ON SCHEMA public TO sankalp_app;
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO sankalp_app;
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO sankalp_app;
+
+-- The ledger is the exception: append and read, nothing else.
+REVOKE TRUNCATE, DELETE, UPDATE ON ledger_entries FROM sankalp_app;
+```
+
+Both conditions on the role are load-bearing. A `REVOKE` against a superuser is ignored, and a `REVOKE` against the table's owner is ignored — so a `sankalp_app` that is either one is theatre, and worse than nothing because it reads like a control.
+
+Scope beyond the SQL: the API and workers move to a `sankalp_app` DSN while migrations keep the owning role (DDL needs it), which means two connection strings in `config.py` rather than one. The test fixture keeps the owning role, since its per-test `TRUNCATE` is the suite's isolation mechanism. That split is why this is its own change and not a line in a migration.
+
 ## Fenced Resource Mutation
 
 The lock is a Redis optimization. The **correctness** is this UPDATE:
