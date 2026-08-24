@@ -25,8 +25,11 @@ import pytest
 from sankalp.config import get_settings
 
 #: Truncated before every test. step_outputs is listed explicitly even though it would go
-#: via CASCADE, so the intent survives someone dropping the FK.
-_TABLES = ("workflows", "step_outputs")
+#: via CASCADE, so the intent survives someone dropping the FK -- and the crash gate's three
+#: tables are listed for the same reason. side_effects in particular MUST start empty in
+#: every repetition: the gate asserts exact row counts, so a leftover row from the previous
+#: run of tests/test_crash.py would read as a double-executed side effect.
+_TABLES = ("workflows", "step_outputs", "side_effects", "step_attempts", "crash_gates")
 
 
 @pytest.fixture(scope="session")

@@ -95,6 +95,20 @@ CREATE TABLE step_outputs (
 
 **Why `fencing_token` lives on the workflow row:** every time a worker claims a workflow it increments. A worker that stalled (GC pause, network partition) and wakes up holding token 7 tries to write while the current owner holds token 8 — and Postgres rejects it. Phase 3 wires this into the resource guard; Phase 1 just needs the counter to exist and increment.
 
+### Gate instrumentation (`migrations/002_crash_gate.sql`)
+
+Three tables exist only so the Phase 1 Gate below can be *measured*. A SIGKILLed process takes its in-memory call counters with it, so "did this step run twice?" has to be answered by rows the dead process already committed.
+
+```sql
+side_effects  (id BIGSERIAL PK, workflow_id, step_name, executed_at)
+step_attempts (id BIGSERIAL PK, workflow_id, step_name, owner_id, pid, attempted_at)
+crash_gates   (workflow_id, step_name, released_at, PK (workflow_id, step_name))
+```
+
+`side_effects` counts effects that actually **committed**; `step_attempts` counts every time a step **started**, and carries the pid so the test can kill the process that is genuinely mid-step. Read together they state the guarantee as two integers — *attempted twice, took effect once*. `crash_gates` lets the test decide when a blocked step may finish, so the kill is aimed rather than timed against a sleep.
+
+`side_effects` must never gain a unique constraint and the demo steps must never write it with `ON CONFLICT DO NOTHING`. Idempotency by construction is Phase 2; if a duplicate insert were swallowed here, "exactly one row" would hold whether or not crash recovery worked and the gate would assert nothing.
+
 ## The Dequeue Query
 
 ```sql
@@ -220,12 +234,26 @@ Note `DO NOTHING` + re-select rather than `DO UPDATE`. A duplicate submit must n
 
 ## Phase 1 Gate
 
-Submit a workflow whose step 2 sleeps 10 seconds. `docker kill` the worker at second 5. Assert:
-- Another worker claims it within `lease_duration`.
-- Step 1 does not re-execute (`step_outputs` still has exactly one row for it; your mock's call counter still reads 1).
+Implemented as `tests/test_crash.py` (`make test-crash`), against the `demo_crash` workflow in `src/sankalp/workflows/demo.py`.
+
+Launch three real `python -m sankalp.engine.worker` **OS processes**, submit a workflow, and `SIGKILL` the one running step 2. SIGKILL specifically, not SIGTERM and not cancellation: the point is a process with zero chance to clean up. SIGTERM runs the drain and *lets in-flight work finish*, and `task.cancel()` unwinds through the executor's `except asyncio.CancelledError` — a worker that gets to run its handlers is not what the guarantee is about.
+
+The kill is aimed, not timed. Step 2 commits a `step_attempts` row carrying its own pid and then blocks, holding an **uncommitted** `side_effects` INSERT open. The test waits for that row and kills that pid, so the crash lands inside step 2 by construction and the killed transaction rolls back. (This replaces the original sketch of "sleeps 10 seconds, `docker kill` at second 5" — a sleep makes every repetition cost its own length and makes the kill a guess. One variant still blocks on a real ~1s sleep, so the gate also covers being killed inside ordinary work.)
+
+Assert:
+- Another **process** resumes step 2 within `lease_duration` — a different pid and a different `owner_id`. An expired lease is the only recovery mechanism, so that is the crash-recovery latency bound.
+- `step_attempts` reads exactly `{step 1: 1, step 2: 2, step 3: 1}` — the killed step was attempted twice, and no other step was re-attempted. **Without this the test can pass by killing a worker that never reached step 2**: the workflow would still succeed and every side-effect count would still read 1, having proven nothing about resuming mid-step.
+- `side_effects` reads exactly 1 per step. Step 1 did not re-execute; step 2's killed attempt left nothing behind.
+- Exactly one `FORWARD` `step_outputs` row per step, and `workflows.attempt = 2` (the signature of one recovery re-claim).
 - Workflow reaches `SUCCESS`.
 
-Automate this as a pytest. You'll run it hundreds of times.
+Run it hundreds of times: `pytest tests/test_crash.py --count=20`.
+
+**The gate has been observed to fail.** Two mechanisms were removed one at a time and the test went red for the right reason each time:
+- Delete `OR (status = 'RUNNING' AND lease_expires_at < now())` from the dequeue query → both variants time out waiting for another worker to resume step 2. Nothing recovers a dead worker's rows.
+- Skip step 1's `commit_step_output` → step 1 shows 2 attempts and **2 `side_effects` rows**. The checkpoint is what makes the resume replay a completed step instead of re-executing it.
+
+A gate that has never been seen to fail is not a gate. Re-run both proofs after any change to the claim query, the checkpoint write, or the lease.
 
 ---
 
