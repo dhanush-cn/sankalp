@@ -29,19 +29,37 @@ The failure branch is the other half of the file, and getting it wrong is how mo
 twice or gets stranded (src/sankalp/engine/errors.py):
 
     RetryableError, attempts left  ->  PENDING, released, run_after = now() + backoff
-    anything else                  ->  COMPENSATING, released, unwound by Phase 2
+    anything else                  ->  COMPENSATING, released, unwound on its next claim
 
 Note which way the default points. An exception the step did not classify is treated as
 terminal, because an unrecognised failure is not evidence that re-running the step is safe,
 while compensation is idempotent by contract.
 
-Until Phase 2 exists, "unwound by Phase 2" needs one more thing to be true: a Phase 1 worker
-that claims a COMPENSATING row must refuse it rather than run it forward. Nothing in the
-schema stops it claiming one -- an unwind is deliberately claimable with no backoff -- so the
-refusal lives here, at the top of :func:`execute_workflow`, ahead of any step invocation.
-Without it a failed workflow is re-executed forward on every claim, and one whose step
-happens to succeed on a later attempt is carried to SUCCESS with its committed side effects
-never unwound.
+**A COMPENSATING claim runs backwards, never forwards.** Nothing in the schema distinguishes
+the two -- an unwind is claimable by the same dequeue query, deliberately with no backoff, and
+arrives here as an ordinary :class:`ClaimedWorkflow`. So :func:`execute_workflow` dispatches on
+``claimed.status`` before it touches a step: COMPENSATING goes to :func:`_compensate`, which
+walks the committed checkpoints in reverse ``seq`` and reverses each one. Lose that dispatch
+and a failed saga is re-executed forward on every claim, and one whose failing step happens to
+succeed on a later attempt is carried all the way to SUCCESS with its committed side effects
+never unwound. ``_FINISH_SUCCESS_SQL``'s ``AND status = 'RUNNING'`` is the second lock on that
+same door; keep both.
+
+There is one COMPENSATING claim :func:`_compensate` never sees: a workflow whose type this
+build does not import, so there is no definition and therefore no list of compensations to
+run. :func:`_defer_compensation` hands that row straight back to the queue. It is a small,
+narrow fallback about *this worker's* deployment, not a way of putting an unwind off -- do not
+confuse the two, and do not route ordinary unwinds through it.
+
+The unwind mirrors the forward loop rather than inventing a second set of rules. A compensation
+is done if and only if a ``step_outputs`` row exists for it with ``kind = 'COMPENSATION'``,
+committed in one transaction with the workflow's position, ownership-guarded, cancellation-
+shielded. What differs is only what it does when a compensation *fails*: there is nowhere left
+to fall back to, so it retries in place a bounded number of times
+(``settings.compensation_max_attempts``, counted in memory -- ``workflows.attempt`` keeps its
+forward history) and then writes FAILED_DIRTY and stops, leaving the remaining steps
+un-reversed for a human. Reverse ``seq`` is a dependency order; carrying on past a failure in
+it can make the mess worse rather than smaller.
 """
 
 from __future__ import annotations
@@ -57,7 +75,14 @@ from typing import Any
 import asyncpg
 
 from sankalp.config import Settings, get_settings
-from sankalp.engine.definition import Step, StepContext, StepOutput, get_definition
+from sankalp.engine.definition import (
+    Step,
+    StepContext,
+    StepOutput,
+    WorkflowDefinition,
+    WorkflowInstance,
+    get_definition,
+)
 from sankalp.engine.errors import PreemptedError, TerminalError
 from sankalp.engine.lease import Lease
 from sankalp.resilience.backoff import compute_backoff
@@ -84,11 +109,19 @@ class ExecutionResult(StrEnum):
 
     SUCCESS = "SUCCESS"
     RETRY_SCHEDULED = "RETRY_SCHEDULED"
+    #: A forward run failed terminally and handed the workflow to the unwind. The row is
+    #: COMPENSATING and immediately claimable; the unwind happens on that next claim, not here.
     COMPENSATING = "COMPENSATING"
+    #: An unwind ran to completion: every compensable step has a committed COMPENSATION row.
+    COMPENSATED = "COMPENSATED"
+    #: An unwind could not finish. Money is in an inconsistent state and a human must resolve
+    #: it -- this is the result to alert on.
+    FAILED_DIRTY = "FAILED_DIRTY"
     PREEMPTED = "PREEMPTED"
-    #: Claimed a workflow that needs unwinding, in a build with nothing to unwind it. Like
-    #: PREEMPTED, this names what this *worker* did, not a state the row is in -- the row is
-    #: COMPENSATING before and after. Phase 2 removes it.
+    #: Claimed an unwind whose ``workflow_type`` this build cannot resolve, and gave it back.
+    #: Like PREEMPTED, this names what this *worker* did, not a state the row is in -- the row
+    #: is COMPENSATING before and after. Not a failure, and not a deferral of the unwind in
+    #: general: a worker that *can* read the type runs it on the next claim.
     COMPENSATION_DEFERRED = "COMPENSATION_DEFERRED"
 
 
@@ -112,33 +145,35 @@ async def execute_workflow(
     """
     settings = settings or get_settings()
 
-    # PHASE 1 ONLY -- delete this branch when Phase 2 wires the compensator, and delete
-    # storage.workflows.defer_compensation with it.
+    # The dispatch. A COMPENSATING row arrives through the same dequeue query as everything
+    # else and looks identical here, so this is the only thing that keeps a failed saga from
+    # being replayed forward -- see the module docstring. It must stay ahead of any step
+    # invocation.
     #
-    # A COMPENSATING row is claimable by the same dequeue query as everything else (that is
-    # deliberate: an unwind must not sit out a backoff). Phase 2 owns the unwind, and until it
-    # exists this worker is the only thing that ever picks such a row up -- so without this
-    # branch it would walk the FORWARD loop again. That re-invokes the step that failed, and a
-    # step which fails once and then succeeds would carry the workflow all the way to SUCCESS
-    # with its earlier side effects never unwound.
-    #
-    # Checked before get_definition on purpose, so a COMPENSATING row whose type this build
-    # does not import also defers cleanly rather than raising and spinning on its lease.
+    # It resolves the definition itself rather than sharing the forward path's call below,
+    # because the two want opposite things from an unresolvable workflow_type. A forward run
+    # raises and keeps its claim: the row is PENDING or RUNNING, its lease expires, and it
+    # waits. An unwind cannot do that -- begin_compensation set run_after = now() so it never
+    # sits out a backoff, so this same ignorant worker would re-claim it a lease later and
+    # every lease after that. It hands the row back instead.
     if claimed.status == "COMPENSATING":
-        return await _defer_compensation(conn_pool, claimed, settings=settings)
+        try:
+            definition = get_definition(claimed.workflow_type)
+        except KeyError as exc:
+            return await _defer_compensation(conn_pool, claimed, exc, settings=settings)
+        return await _compensate(
+            conn_pool,
+            claimed,
+            definition,
+            _lease_for(conn_pool, claimed, lease, settings),
+            settings=settings,
+        )
 
     # Deliberately outside the try below: an unknown workflow_type means this build does not
     # import the definition, which is a deployment fact about *us*, not a failure of the
     # workflow. Compensating it here would unwind real money because a worker was stale.
     definition = get_definition(claimed.workflow_type)
-
-    if lease is None:
-        lease = Lease(
-            conn_pool,
-            claimed,
-            duration_seconds=settings.lease_duration_seconds,
-            renew_divisor=settings.lease_renew_divisor,
-        )
+    lease = _lease_for(conn_pool, claimed, lease, settings)
 
     own = workflow_writes.Ownership.of(claimed)
     instance = definition.instantiate()
@@ -210,18 +245,43 @@ async def execute_workflow(
         )
 
 
+def _lease_for(
+    conn_pool: asyncpg.Pool,
+    claimed: ClaimedWorkflow,
+    lease: Lease | None,
+    settings: Settings,
+) -> Lease:
+    """The worker's lease, or a standalone one so this module is usable without a worker."""
+    if lease is not None:
+        return lease
+    return Lease(
+        conn_pool,
+        claimed,
+        duration_seconds=settings.lease_duration_seconds,
+        renew_divisor=settings.lease_renew_divisor,
+    )
+
+
 async def _defer_compensation(
     conn_pool: asyncpg.Pool,
     claimed: ClaimedWorkflow,
+    exc: KeyError,
     *,
     settings: Settings,
 ) -> ExecutionResult:
-    """Give a COMPENSATING workflow back to the queue, later. PHASE 1 ONLY.
+    """Give an unwind back because this build cannot read its ``workflow_type``.
 
-    WARNING rather than DEBUG, and naming the reason, because a deferred workflow and a stuck
+    The narrow case, and the only one: see
+    :func:`sankalp.storage.workflows.defer_compensation` for why handing the row back beats
+    raising, failing dirty, or guessing. This is **not** a general "unwind later" path --
+    :func:`_compensate` runs the unwind, and every COMPENSATING claim a worker can actually
+    resolve goes there.
+
+    WARNING rather than DEBUG, and naming the type, because a deferred workflow and a stuck
     one look identical from the outside -- COMPENSATING, unowned, going nowhere. Whoever finds
-    such a row at 3am should learn why from the logs, not have to infer it from the absence of
-    a compensator.
+    such a row at 3am should learn from the logs that some worker could not read its type,
+    not have to infer it. If every worker in the fleet logs this, the definition is missing
+    from the deployment and the saga is genuinely stalled.
 
     Reuses :func:`compute_backoff` rather than a fixed delay so repeated deferrals spread out
     with the same jitter as everything else; a fixed one would sync every deferred workflow in
@@ -229,10 +289,12 @@ async def _defer_compensation(
     """
     delay = compute_backoff(claimed.attempt, cap_seconds=settings.backoff_cap_seconds)
     log.warning(
-        "COMPENSATING workflow %s (%s) claimed by a Phase-1 worker with no compensator; "
-        "deferring for %.1fs until Phase 2 wires the unwind (attempt %d)",
+        "COMPENSATING workflow %s claimed by a worker that cannot resolve its type %r "
+        "(%s); handing it back for %.1fs so a worker that imports the definition can unwind "
+        "it (attempt %d)",
         claimed.id,
         claimed.workflow_type,
+        exc,
         delay,
         claimed.attempt,
     )
@@ -240,10 +302,231 @@ async def _defer_compensation(
         conn_pool, workflow_writes.Ownership.of(claimed), delay_seconds=delay
     ):
         log.warning(
-            "workflow %s was re-claimed before its compensation could be deferred", claimed.id
+            "workflow %s was re-claimed before its compensation could be handed back",
+            claimed.id,
         )
         return ExecutionResult.PREEMPTED
     return ExecutionResult.COMPENSATION_DEFERRED
+
+
+async def _compensate(
+    conn_pool: asyncpg.Pool,
+    claimed: ClaimedWorkflow,
+    definition: WorkflowDefinition,
+    lease: Lease,
+    *,
+    settings: Settings,
+) -> ExecutionResult:
+    """Reverse a failed saga: run each completed step's compensation, newest first.
+
+    The whole flow is docs/spec.md, "Compensation Model", and it is the forward loop read
+    backwards. One query loads what already happened -- the committed FORWARD checkpoints in
+    reverse ``seq`` order, and the set of steps already undone -- and from there the same
+    three properties hold as on the way in. A compensation is skipped if a row exists for it;
+    it and its checkpoint commit together; nothing is written without proving ownership.
+
+    Two things are skipped rather than run: a step already in ``compensated`` (a resume after
+    a crash mid-unwind) and a step with no compensation declared at all, which is a read-only
+    step -- a balance check, a fraud lookup -- with nothing to undo.
+
+    A compensation that cannot be made to succeed ends the unwind at that step, in
+    FAILED_DIRTY. The steps below it are deliberately left alone: reverse ``seq`` is a
+    dependency order, so an undo whose ordering precondition has just been violated can make
+    the inconsistency worse rather than smaller. The committed COMPENSATION rows say exactly
+    how far it got, which is what the human resolving it needs.
+    """
+    own = workflow_writes.Ownership.of(claimed)
+    instance = definition.instantiate()
+    forward, compensated = await workflow_writes.load_unwind_state(conn_pool, claimed.id)
+    # Every committed forward output, so a compensation can read a sibling step's result as
+    # well as its own -- read-only, for the reason in _context_for.
+    outputs: dict[str, Any] = {record.step_name: record.output for record in forward}
+
+    try:
+        for record in forward:
+            # Membership, never truthiness: a compensation row carries a NULL output, so a
+            # truthiness test here would re-run every undo in the workflow.
+            if record.step_name in compensated:
+                log.debug(
+                    "workflow %s: %r is already compensated, skipping",
+                    claimed.id, record.step_name,
+                )
+                continue
+
+            try:
+                step = definition.step_by_name(record.step_name)
+            except KeyError as exc:
+                # The definition changed under an in-flight saga. There is a committed side
+                # effect whose undo this build cannot even name, so there is no honest state
+                # other than "a human must look at this".
+                return await _fail_dirty(
+                    conn_pool, own, claimed, error=_describe("unwind", exc), exc=exc
+                )
+
+            if step.compensation is None:
+                log.debug(
+                    "workflow %s: %r declares no compensation (read-only), skipping",
+                    claimed.id, step.name,
+                )
+                continue
+
+            if not await lease.renew_if_needed():
+                raise PreemptedError(
+                    f"workflow {claimed.id} was re-claimed past fencing token "
+                    f"{claimed.fencing_token} before {step.name!r} could be compensated"
+                )
+
+            ctx = _context_for(claimed, step, outputs, lease)
+            started = time.monotonic()
+            failure = await _run_compensation(
+                instance, step, ctx, record.output, lease, settings=settings
+            )
+            elapsed = time.monotonic() - started
+
+            if failure is not None:
+                return await _fail_dirty(
+                    conn_pool,
+                    own,
+                    claimed,
+                    error=_describe(f"compensation for step {step.name!r}", failure),
+                    exc=failure,
+                )
+
+            if not await _commit_compensation(conn_pool, own, step=step, elapsed=elapsed):
+                raise PreemptedError(
+                    f"workflow {claimed.id} was re-claimed past fencing token "
+                    f"{claimed.fencing_token} while {step.name!r} was being compensated; its "
+                    "checkpoint was rolled back and the new owner will re-run the undo"
+                )
+            log.info("workflow %s: compensated %r", claimed.id, step.name)
+
+        if not await workflow_writes.finish_compensated(conn_pool, own):
+            raise PreemptedError(
+                f"workflow {claimed.id} was re-claimed past fencing token "
+                f"{claimed.fencing_token} before it could be marked COMPENSATED"
+            )
+        log.info(
+            "workflow %s (%s) fully compensated", claimed.id, claimed.workflow_type
+        )
+        return ExecutionResult.COMPENSATED
+
+    except PreemptedError as exc:
+        # Same as on the way in: the row belongs to someone else, who is resuming the unwind
+        # from the same COMPENSATION checkpoints we were reading. Write nothing.
+        log.warning("%s", exc)
+        return ExecutionResult.PREEMPTED
+
+    except asyncio.CancelledError:
+        # A hard shutdown cancelled us mid-unwind. Leave the row COMPENSATING: its lease
+        # expires, another worker claims it, and it resumes at the first step without a
+        # COMPENSATION row. Marking it FAILED_DIRTY here would page a human because this
+        # process was told to stop.
+        log.warning(
+            "workflow %s cancelled mid-compensation; leaving it to its lease", claimed.id
+        )
+        raise
+
+
+async def _run_compensation(
+    instance: WorkflowInstance,
+    step: Step,
+    ctx: StepContext,
+    forward_output: StepOutput,
+    lease: Lease,
+    *,
+    settings: Settings,
+) -> Exception | None:
+    """Run one undo until it works or the budget runs out. Returns the last failure, or None.
+
+    The retry policy here is the **inverse** of the forward one, and deliberately so. A
+    forward step that raises something it did not classify is treated as terminal, because an
+    unrecognised failure is not evidence that re-running it is safe -- it may already have
+    moved money. A compensation is idempotent by contract (docs/spec.md: ``refund_if_not_
+    already_refunded``, not ``refund``), so re-running one *is* safe, and the expensive
+    mistake is the other way round: giving up on a transient failure strands a saga in
+    FAILED_DIRTY and pages someone for a downstream blip that cleared a second later.
+
+    So everything is retried except an explicit ``TerminalError``, which is the compensation
+    itself saying that waiting will not help, and ``PreemptedError``, which is not a failure
+    of the undo at all -- it means we no longer own the workflow and must write nothing.
+    ``asyncio.CancelledError`` propagates for the same reason (it is a BaseException and is
+    not caught below).
+
+    The budget is counted here, in memory, rather than on ``workflows.attempt``: that column
+    is the forward run's history and stays intact, and counting in memory means the number
+    measures *compensation failures* -- a crash mid-unwind gives the resuming worker a fresh
+    budget instead of spending someone else's.
+    """
+    attempts = settings.compensation_max_attempts
+    last: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            await step.invoke_compensation(instance, ctx, forward_output)
+            return None
+        except PreemptedError:
+            raise
+        except TerminalError as exc:
+            log.error(
+                "workflow %s: compensation for %r failed terminally on attempt %d/%d; "
+                "retrying would fail the same way: %s",
+                ctx.workflow_id, step.name, attempt, attempts, exc,
+            )
+            return exc
+        except Exception as exc:
+            last = exc
+            if attempt == attempts:
+                break
+            delay = compute_backoff(attempt, cap_seconds=settings.backoff_cap_seconds)
+            log.warning(
+                "workflow %s: compensation for %r failed on attempt %d/%d, retrying in "
+                "%.1fs: %s",
+                ctx.workflow_id, step.name, attempt, attempts, delay, exc,
+            )
+            await asyncio.sleep(delay)
+            # Renew after the sleep, not before it: the backoff is where this coroutine spends
+            # nearly all of its time, and a lease that was healthy going in may not be coming
+            # out. Losing it here means the next attempt would run an undo whose checkpoint
+            # the ownership guard is already certain to reject.
+            if not await lease.renew_if_needed():
+                raise PreemptedError(
+                    f"workflow {ctx.workflow_id} was re-claimed past fencing token "
+                    f"{ctx.fencing_token} while {step.name!r}'s compensation was backing off"
+                ) from exc
+
+    return last
+
+
+async def _fail_dirty(
+    conn_pool: asyncpg.Pool,
+    own: workflow_writes.Ownership,
+    claimed: ClaimedWorkflow,
+    *,
+    error: str,
+    exc: Exception,
+) -> ExecutionResult:
+    """Park a workflow whose unwind could not finish, and say so loudly.
+
+    ERROR, with the exception attached, because this is the one status in the schema that
+    means *stop and fetch a person*: a side effect is committed, the engine has exhausted what
+    it can do about that, and nothing will retry it. A FAILED_DIRTY row that nobody was told
+    about is indistinguishable from money quietly going missing.
+    """
+    log.error(
+        "workflow %s (%s) is FAILED_DIRTY: %s. Committed side effects have NOT been fully "
+        "reversed -- the COMPENSATION rows in step_outputs show how far the unwind got, and "
+        "a human must resolve the rest",
+        claimed.id,
+        claimed.workflow_type,
+        error,
+        exc_info=exc,
+    )
+    if not await workflow_writes.fail_dirty(conn_pool, own, error=error):
+        log.warning(
+            "workflow %s was re-claimed before it could be marked FAILED_DIRTY", claimed.id
+        )
+        return ExecutionResult.PREEMPTED
+    return ExecutionResult.FAILED_DIRTY
 
 
 def _context_for(
@@ -284,21 +567,8 @@ async def _commit_finished_step(
     By the time this is called the step's side effect has happened. All that is left is
     writing it down, and a cancellation landing in that gap is the one case where losing the
     race actually costs something: the checkpoint never appears, so the resume re-executes a
-    step that already moved money. Until a step is idempotent by construction (Phase 2, a
-    natural key plus ``ON CONFLICT DO NOTHING``) that is a real double-execution, not a
-    theoretical one.
-
-    So the commit is shielded and then explicitly awaited on the way out. Shielding alone is
-    not enough: it detaches the write but lets this coroutine unwind immediately, and the
-    worker's drain would then return -- and close the pool -- with the write still in flight.
-    Awaiting ``commit`` in the cancellation handler is what makes the drain wait for it,
-    because the wait happens inside the task the drain is already gathering.
-
-    This narrows the window rather than closing it. A SIGKILL, a lost connection, or a
-    cancellation arriving *during* the commit still leaves the step uncheckpointed, and the
-    engine's answer to that is unchanged: execution is at-least-once and steps must be
-    idempotent. What this buys is that an orderly shutdown no longer throws away work it had
-    already finished.
+    step that already moved money. Until a step is idempotent by construction (a natural key
+    plus ``ON CONFLICT DO NOTHING``) that is a real double-execution, not a theoretical one.
     """
     commit = asyncio.ensure_future(
         workflow_writes.commit_step_output(
@@ -312,6 +582,50 @@ async def _commit_finished_step(
             duration_seconds=elapsed,
         )
     )
+    return await _commit_shielded(commit, f"step {step.name!r}")
+
+
+async def _commit_compensation(
+    conn_pool: asyncpg.Pool,
+    own: workflow_writes.Ownership,
+    *,
+    step: Step,
+    elapsed: float,
+) -> bool:
+    """Checkpoint a compensation that has already run. The undo's half of the pair above.
+
+    Shielded for the same reason and with the same honesty about what it buys: the undo has
+    happened, only the record of it is outstanding, and losing that record means the undo runs
+    again on the resume. Compensations are required to be idempotent precisely because that
+    window cannot be closed -- this only stops an *orderly* shutdown from walking into it.
+    """
+    commit = asyncio.ensure_future(
+        workflow_writes.commit_compensation_output(
+            conn_pool,
+            own,
+            step_name=step.name,
+            seq=step.seq,
+            duration_seconds=elapsed,
+        )
+    )
+    return await _commit_shielded(commit, f"compensation for step {step.name!r}")
+
+
+async def _commit_shielded(commit: asyncio.Future[bool], what: str) -> bool:
+    """Await a checkpoint write so that a cancellation cannot abandon it half-issued.
+
+    The commit is shielded and then explicitly awaited on the way out. Shielding alone is not
+    enough: it detaches the write but lets this coroutine unwind immediately, and the worker's
+    drain would then return -- and close the pool -- with the write still in flight. Awaiting
+    ``commit`` in the cancellation handler is what makes the drain wait for it, because the
+    wait happens inside the task the drain is already gathering.
+
+    This narrows the window rather than closing it. A SIGKILL, a lost connection, or a
+    cancellation arriving *during* the commit still leaves the work uncheckpointed, and the
+    engine's answer to that is unchanged: execution is at-least-once and both steps and
+    compensations must be idempotent. What it buys is that an orderly shutdown no longer
+    throws away work it had already finished.
+    """
     try:
         return await asyncio.shield(commit)
     except asyncio.CancelledError:
@@ -319,22 +633,22 @@ async def _commit_finished_step(
             committed = await commit
         except Exception:
             log.exception(
-                "cancelled while checkpointing %r, and the write did not land; the step will "
-                "re-run when another worker resumes this workflow",
-                step.name,
+                "cancelled while checkpointing %s, and the write did not land; it will run "
+                "again when another worker resumes this workflow",
+                what,
             )
         else:
             if committed:
                 log.info(
-                    "cancelled during %r, but its checkpoint committed -- the resume will "
-                    "replay it rather than re-run it",
-                    step.name,
+                    "cancelled during %s, but its checkpoint committed -- the resume will "
+                    "skip it rather than re-run it",
+                    what,
                 )
             else:
                 log.warning(
-                    "cancelled during %r, and its checkpoint was rejected: this worker had "
+                    "cancelled during %s, and its checkpoint was rejected: this worker had "
                     "already been preempted",
-                    step.name,
+                    what,
                 )
         raise
 

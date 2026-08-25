@@ -16,11 +16,12 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from typing import Any
 
 import asyncpg
 import pytest
+from fleet import WorkerFleet
 
 from sankalp.config import get_settings
 
@@ -181,6 +182,24 @@ def insert_workflow(conn: asyncpg.Connection) -> Callable[..., Awaitable[uuid.UU
         )
 
     return _insert
+
+
+@pytest.fixture
+def workers(truncate_tables: None) -> Iterator[WorkerFleet]:
+    """A fleet of real worker processes, always torn down.
+
+    Depends on ``truncate_tables`` so no worker is running while the tables are emptied: a
+    worker that claimed a row from the previous repetition would be writing into a schema
+    this one is about to wipe.
+
+    Lives here rather than in one test file because both crash gates need it -- one kills a
+    worker inside a forward step, the other inside a compensation.
+    """
+    fleet = WorkerFleet()
+    try:
+        yield fleet
+    finally:
+        fleet.shutdown()
 
 
 @pytest.fixture

@@ -45,14 +45,18 @@ that has nothing to do with the crash.
 from __future__ import annotations
 
 import asyncio
-import os
 from typing import Any
 
 import asyncpg
 
 from sankalp.engine.definition import StepContext, step, workflow
 from sankalp.engine.errors import TerminalError
-from sankalp.storage.pool import create_pool
+from sankalp.workflows._instrumentation import (
+    await_gate,
+    get_pool,
+    record_attempt,
+    record_side_effect,
+)
 
 __all__ = ["DemoCrash", "WORKFLOW_TYPE", "STEP_NAMES", "GATED_STEP"]
 
@@ -67,87 +71,18 @@ STEP_NAMES = ("reserve_funds", "hold", "settle")
 #: The step the gate kills inside of.
 GATED_STEP = "hold"
 
-#: Ceiling on how long ``hold`` waits for its gate. Purely a safety net: the test always
-#: releases the gate, so hitting this means something is wrong, and failing loudly beats a
-#: repetition that hangs until pytest is killed by hand.
-_GATE_TIMEOUT_SECONDS = 60.0
-
-#: How often the gate is polled. LISTEN/NOTIFY would avoid the poll, but it would also make
-#: the step's wait depend on a connection staying healthy across the very kill this exists to
-#: study; a cheap indexed lookup has no such failure mode.
-_GATE_POLL_SECONDS = 0.02
-
-# A pool of this module's own, because the engine hands a step a StepContext and not a
-# connection -- by design (engine/definition.py: the definition "holds no connection, opens
-# no transaction"). It points at settings.active_database_url, so a worker launched with
-# SANKALP_ENVIRONMENT=test records into sankalp_test like everything else in the run.
-_pool: asyncpg.Pool | None = None
-_pool_lock = asyncio.Lock()
-
-
-async def _get_pool() -> asyncpg.Pool:
-    """This module's pool, opened on first use.
-
-    Double-checked under a lock: several steps can start concurrently on one worker, and two
-    of them racing here would open two pools and leak one.
-    """
-    global _pool
-    if _pool is not None:
-        return _pool
-    async with _pool_lock:
-        if _pool is None:
-            _pool = await create_pool()
-    return _pool
-
 
 async def _record_attempt(conn: asyncpg.Connection, ctx: StepContext) -> None:
-    """Commit "this process is starting this step, right now", with the pid to kill.
-
-    Written before the step does anything the test might kill it during, and committed on its
-    own rather than joined to the side effect -- an attempt that was interrupted still
-    happened, and the gate's ability to distinguish "attempted twice, took effect once" from
-    "never got there" depends on this row outliving the process that wrote it.
-    """
-    await conn.execute(
-        """
-        INSERT INTO step_attempts (workflow_id, step_name, owner_id, pid)
-        VALUES ($1, $2, $3, $4)
-        """,
-        ctx.workflow_id,
-        ctx.step_name,
-        ctx.owner_id or "unknown",
-        os.getpid(),
-    )
+    """Announce this step under its own name. See workflows/_instrumentation.py."""
+    await record_attempt(conn, ctx.workflow_id, ctx.step_name or "unknown", ctx.owner_id)
 
 
 async def _record_side_effect(conn: asyncpg.Connection, ctx: StepContext) -> None:
-    """Record one side effect. Plain INSERT -- no ON CONFLICT; see the module docstring."""
-    await conn.execute(
-        "INSERT INTO side_effects (workflow_id, step_name) VALUES ($1, $2)",
-        ctx.workflow_id,
-        ctx.step_name,
-    )
+    await record_side_effect(conn, ctx.workflow_id, ctx.step_name or "unknown")
 
 
 async def _await_gate(conn: asyncpg.Connection, ctx: StepContext) -> None:
-    """Block until the test releases this step, or fail loudly at the timeout."""
-    deadline = asyncio.get_running_loop().time() + _GATE_TIMEOUT_SECONDS
-    while True:
-        released = await conn.fetchval(
-            "SELECT 1 FROM crash_gates WHERE workflow_id = $1 AND step_name = $2",
-            ctx.workflow_id,
-            ctx.step_name,
-        )
-        if released is not None:
-            return
-        if asyncio.get_running_loop().time() >= deadline:
-            raise TerminalError(
-                f"step {ctx.step_name!r} of workflow {ctx.workflow_id} waited "
-                f"{_GATE_TIMEOUT_SECONDS:.0f}s for its crash_gates row and it never arrived. "
-                "The crash gate releases it right after the kill -- a timeout here means the "
-                "test never got that far, not that the step is slow."
-            )
-        await asyncio.sleep(_GATE_POLL_SECONDS)
+    await await_gate(conn, ctx.workflow_id, ctx.step_name or "unknown")
 
 
 @workflow(WORKFLOW_TYPE)
@@ -162,7 +97,7 @@ class DemoCrash:
         before step 2 starts, so the resume has to replay it from ``step_outputs`` as a
         lookup rather than re-execute it.
         """
-        pool = await _get_pool()
+        pool = await get_pool()
         async with pool.acquire() as conn:
             await _record_attempt(conn, ctx)
             async with conn.transaction():
@@ -178,7 +113,7 @@ class DemoCrash:
         the transaction that a SIGKILL must be able to roll back -- so it must not be the
         same connection, or the attempt row would die with it and the test would be blind.
         """
-        pool = await _get_pool()
+        pool = await get_pool()
         async with pool.acquire() as marker, pool.acquire() as effect:
             await _record_attempt(marker, ctx)
             # Everything from here until this block exits is inside one transaction. A
@@ -211,7 +146,7 @@ class DemoCrash:
     @step(seq=3)
     async def settle(self, ctx: StepContext) -> dict[str, Any]:
         """The step after the crash. Its side effect proves the workflow ran to the end."""
-        pool = await _get_pool()
+        pool = await get_pool()
         async with pool.acquire() as conn:
             await _record_attempt(conn, ctx)
             async with conn.transaction():

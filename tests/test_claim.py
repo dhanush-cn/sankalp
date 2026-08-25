@@ -172,6 +172,88 @@ async def test_compensating_workflow_stays_compensating(conn, insert_workflow):
     assert await _status_of(conn, workflow_id) == "COMPENSATING"
 
 
+async def test_a_compensating_workflow_under_a_live_lease_cannot_be_claimed(
+    conn, connect, insert_workflow
+):
+    """An unwind in progress is an OWNED row. It gets the same protection a RUNNING row does.
+
+    This is the regression that matters most in this file. The predicate used to read
+    ``status IN ('PENDING', 'COMPENSATING')`` -- unconditional, no lease test -- so a worker
+    part-way through reversing a saga was re-claimed out from under itself on the very next
+    poll, and two, three, four workers ran the same compensation concurrently. Fencing still
+    made only one checkpoint commit, so the *state* stayed correct; what did not was the
+    money, because each racing worker had already executed the refund before its write was
+    rejected. Nothing caught that but the compensation's own idempotency.
+
+    Forward and backward execution get one ownership rule between them, and this is it.
+    """
+    workflow_id = await insert_workflow(
+        status="COMPENSATING", owner_id="worker-a", lease_expires_in_seconds=30
+    )
+    other = await connect()
+
+    assert await claim_workflows(other, "worker-b", LEASE, 10) == [], (
+        "worker-b claimed a COMPENSATING workflow that worker-a is still unwinding under a "
+        "live lease; both would now run the same compensations at the same time"
+    )
+    row = await conn.fetchrow(
+        "SELECT owner_id, fencing_token FROM workflows WHERE id = $1", workflow_id
+    )
+    assert row["owner_id"] == "worker-a", "the live owner must keep the row"
+    assert row["fencing_token"] == 0, (
+        "a rejected claim must not bump the fencing token -- doing so would preempt the "
+        "worker that is legitimately unwinding this saga"
+    )
+
+
+async def test_a_compensating_workflow_is_claimable_once_its_lease_expires(
+    conn, connect, insert_workflow, expire_lease
+):
+    """...and recovery still works: the unwinding worker died, so somebody else resumes it.
+
+    The other half of the pair above. Protecting an in-flight unwind must not strand one --
+    an expired lease is the only recovery mechanism in this engine, and it has to cover the
+    backward direction exactly as it covers the forward one.
+    """
+    workflow_id = await insert_workflow(
+        status="COMPENSATING", owner_id="worker-a", lease_expires_in_seconds=30
+    )
+    other = await connect()
+    assert await claim_workflows(other, "worker-b", LEASE, 10) == []
+
+    await expire_lease(workflow_id)
+
+    claimed = await claim_workflows(other, "worker-b", LEASE, 10)
+
+    assert [w.id for w in claimed] == [workflow_id], (
+        "a COMPENSATING workflow whose owner died must become claimable again, or a saga "
+        "whose unwinding worker was killed is stranded half-reversed forever"
+    )
+    assert claimed[0].status == "COMPENSATING", "and it must still be unwinding, not RUNNING"
+    assert claimed[0].fencing_token == 1, (
+        "the new owner must hold a higher token so the dead worker's writes are rejected "
+        "if it ever comes back"
+    )
+    assert await _status_of(conn, workflow_id) == "COMPENSATING"
+
+
+async def test_a_freshly_compensating_workflow_is_claimable_immediately(
+    conn, insert_workflow
+):
+    """begin_compensation leaves the lease NULL, and that is the branch that keeps it free.
+
+    An unwind must not sit out a backoff -- money is already committed in the steps it has to
+    reverse. The IS NULL test is what makes "respects its lease" and "immediately claimable"
+    both true at once, so tightening the predicate cannot have quietly reintroduced a delay.
+    """
+    workflow_id = await insert_workflow(status="COMPENSATING", lease_expires_in_seconds=None)
+
+    claimed = await claim_workflows(conn, "worker-a", LEASE, 10)
+
+    assert [w.id for w in claimed] == [workflow_id]
+    assert claimed[0].status == "COMPENSATING"
+
+
 async def test_batch_size_caps_the_claim(conn, insert_workflow):
     for _ in range(5):
         await insert_workflow()

@@ -20,15 +20,27 @@ from uuid import UUID
 
 import asyncpg
 
-#: Verbatim from docs/spec.md. Three clauses are load-bearing:
+#: Verbatim from docs/spec.md. Four clauses are load-bearing:
 #:
 #:   * ``FOR UPDATE SKIP LOCKED`` -- N workers poll simultaneously and never collide.
 #:     Without it they all queue behind the same row and claiming serialises.
-#:   * ``status = 'RUNNING' AND lease_expires_at < now()`` -- this is the whole of crash
-#:     recovery. Remove it and a killed worker's workflows are stranded forever.
+#:   * ``lease_expires_at < now()`` on RUNNING -- this is the whole of crash recovery.
+#:     Remove it and a killed worker's workflows are stranded forever.
+#:   * COMPENSATING is subject to the same lease test, with ``lease_expires_at IS NULL``
+#:     as the branch that keeps a *fresh* unwind instantly claimable. Do not "simplify"
+#:     this back to an unconditional ``status IN ('PENDING', 'COMPENSATING')``. That form
+#:     makes a COMPENSATING row claimable no matter who holds it, so a worker that is
+#:     part-way through an unwind is re-claimed out from under itself on the next poll and
+#:     several workers run the same compensation at once. Fencing keeps the *effects*
+#:     exactly-once -- only one checkpoint commits -- but each racing worker has already
+#:     executed the compensation's side effect before its write is rejected, so what stops
+#:     the duplicate refund is nothing but the compensation's own idempotency.
+#:     ``begin_compensation`` nulls the lease and sets ``run_after = now()``, which is what
+#:     makes the IS NULL branch enough for "an unwind never sits out a backoff".
 #:   * ``ORDER BY run_after`` inside the subquery -- matches the leading column of the
 #:     partial index ``idx_workflows_claimable``, so a claim is an ordered walk that stops
-#:     at LIMIT rather than a sort of the entire backlog.
+#:     at LIMIT rather than a sort of the entire backlog. That index's predicate is still a
+#:     superset of this filter, so it remains usable and no migration is needed.
 #:
 #: The CASE on status exists so a COMPENSATING workflow stays COMPENSATING when it is
 #: re-claimed; only PENDING work becomes RUNNING.
@@ -52,8 +64,9 @@ FROM (
     FROM workflows
     WHERE run_after <= now()
       AND (
-            status IN ('PENDING', 'COMPENSATING')
-            OR (status = 'RUNNING' AND lease_expires_at < now())
+            status = 'PENDING'
+            OR (status IN ('RUNNING', 'COMPENSATING')
+                AND (lease_expires_at IS NULL OR lease_expires_at < now()))
           )
     ORDER BY run_after
     FOR UPDATE SKIP LOCKED
@@ -135,9 +148,16 @@ async def claim_workflows(
     """Claim up to ``batch_size`` runnable workflows for ``owner_id``.
 
     Returns the claimed rows with their new ``fencing_token`` and lease, or an empty list
-    if nothing is runnable. Claimable means: ``run_after`` has passed, and the workflow is
-    either waiting (PENDING / COMPENSATING) or is RUNNING under an expired lease -- the
-    latter being a worker that died holding it.
+    if nothing is runnable. Claimable means ``run_after`` has passed and one of:
+
+      * the workflow is PENDING -- waiting for a first or a retried run;
+      * it is RUNNING or COMPENSATING and **unowned** (``lease_expires_at IS NULL``), which
+        is how ``begin_compensation`` hands an unwind straight to the queue;
+      * it is RUNNING or COMPENSATING under an **expired** lease -- a worker died holding it.
+
+    A live lease excludes everyone in both directions. A COMPENSATING row with a lease on it
+    is an owned row being actively unwound, not a queue entry, and it is protected exactly
+    as a RUNNING one is; when its owner dies, the same expiry recovers it.
 
     No transaction is opened. The statement is a single UPDATE and therefore already
     atomic; wrapping it would only hold the row locks longer and starve other claimers.

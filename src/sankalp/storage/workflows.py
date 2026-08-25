@@ -16,8 +16,10 @@ that matters, that it was preempted. That is why each function here returns ``bo
 than ``None``: **False means preempted**, and the caller must drop the work rather than
 carry on. Never "fix" one of these by dropping the guard or by ignoring the return value.
 
-The one read, :func:`load_forward_outputs`, is what makes replay a lookup instead of a flag:
-a step is done if and only if a row exists for it (migrations/001_core_schema.sql).
+The two reads, :func:`load_forward_outputs` and :func:`load_unwind_state`, are what make
+replay a lookup instead of a flag: a step is done if and only if a row exists for it, and its
+undo is done if and only if a second row exists with ``kind = 'COMPENSATION'``
+(migrations/001_core_schema.sql). One rule, applied twice.
 """
 
 from __future__ import annotations
@@ -38,11 +40,16 @@ from sankalp.storage.queue import ClaimedWorkflow
 JsonValue = Any
 
 __all__ = [
+    "CompletedStep",
     "Ownership",
     "rows_affected",
     "load_forward_outputs",
+    "load_unwind_state",
     "commit_step_output",
+    "commit_compensation_output",
     "finish_success",
+    "finish_compensated",
+    "fail_dirty",
     "schedule_retry",
     "begin_compensation",
     "defer_compensation",
@@ -123,6 +130,58 @@ async def load_forward_outputs(pool: asyncpg.Pool, workflow_id: UUID) -> dict[st
     return {r["step_name"]: _decode(r["output"]) for r in records}
 
 
+#: Both kinds in one query, because the unwind needs both and they live in one table. The
+#: ``ORDER BY seq DESC`` is the unwind order itself (docs/spec.md, "Compensation Model"), and
+#: it is taken from the persisted ``seq`` rather than from ``definition.steps`` on purpose: a
+#: definition edited under an in-flight saga would otherwise silently reorder the reversal of
+#: money that has already moved. The row says what order it ran in; the code does not get a
+#: second opinion.
+_LOAD_UNWIND_STATE_SQL = """
+SELECT step_name, seq, kind, output
+FROM step_outputs
+WHERE workflow_id = $1
+ORDER BY seq DESC
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedStep:
+    """One committed FORWARD checkpoint, as the unwind reads it back.
+
+    ``output`` is what the forward step returned and is handed straight to its compensation --
+    which is the entire reason an unwind is possible after a crash that lost every scrap of
+    in-memory state.
+    """
+
+    step_name: str
+    seq: int
+    output: JsonValue
+
+
+async def load_unwind_state(
+    pool: asyncpg.Pool, workflow_id: UUID
+) -> tuple[list[CompletedStep], set[str]]:
+    """Everything the COMPENSATING pass needs, in one round trip.
+
+    Returns the completed forward steps in reverse ``seq`` order -- the order their
+    compensations must run in -- and the names of the steps whose compensation has already
+    committed.
+
+    That second set is the idempotency guard, and it is the same rule as the forward replay
+    check: a compensation is done if and only if a row exists. Membership, never truthiness --
+    a compensation stores no output, so every one of these rows has ``output IS NULL`` and a
+    truthiness test would re-run every undo in the workflow.
+    """
+    records = await pool.fetch(_LOAD_UNWIND_STATE_SQL, workflow_id)
+    forward = [
+        CompletedStep(step_name=r["step_name"], seq=r["seq"], output=_decode(r["output"]))
+        for r in records
+        if r["kind"] == "FORWARD"
+    ]
+    compensated = {r["step_name"] for r in records if r["kind"] == "COMPENSATION"}
+    return forward, compensated
+
+
 # ---------------------------------------------------------------------------
 # Writes. All ownership-guarded; all return False when preempted.
 # ---------------------------------------------------------------------------
@@ -153,9 +212,9 @@ VALUES ($1, $2, $3, 'FORWARD', $4::jsonb, now() - make_interval(secs => $5::floa
 #: path and makes one specific catastrophe unrepresentable: a COMPENSATING workflow being
 #: promoted to SUCCESS. That transition would mark a saga complete while the forward steps it
 #: was unwinding stay un-unwound, i.e. money moved and the row says everything is fine.
-#: The executor also refuses to run a COMPENSATING claim forward, which means this predicate
-#: should never be the thing that fires. Keep both: that check is a Python branch one edit
-#: away from being lost, and this is the lock on the door itself.
+#: The executor also routes a COMPENSATING claim to the unwind rather than the forward loop,
+#: which means this predicate should never be the thing that fires. Keep both: that dispatch
+#: is a Python branch one edit away from being lost, and this is the lock on the door itself.
 _FINISH_SUCCESS_SQL = """
 UPDATE workflows
 SET status           = 'SUCCESS',
@@ -195,12 +254,69 @@ SET status           = 'COMPENSATING',
 WHERE id = $1 AND owner_id = $3 AND fencing_token = $4
 """
 
+#: The compensation half of ``_CHECKPOINT_POSITION_SQL``, and the extra ``AND status =
+#: 'COMPENSATING'`` is the same kind of guard as the one on ``_FINISH_SUCCESS_SQL``: an undo
+#: may only be recorded against a workflow that is actually unwinding. ``current_step`` is
+#: moved to the step being reversed so an operator watching the row sees the unwind walk
+#: backwards through it, rather than the row appearing frozen at the step that failed.
+_CHECKPOINT_COMPENSATION_POSITION_SQL = """
+UPDATE workflows
+SET current_step = $2, updated_at = now()
+WHERE id = $1 AND owner_id = $3 AND fencing_token = $4
+  AND status = 'COMPENSATING'
+"""
+
+#: The undo's checkpoint. ``output`` is NULL because a compensation returns nothing -- the row
+#: exists to say "this was undone", and that fact is the whole payload. Same shape as the
+#: forward insert otherwise, including deriving ``started_at`` from the server's ``now()``
+#: minus the measured duration so both ends of the compensation are stamped by one clock.
+_INSERT_COMPENSATION_OUTPUT_SQL = """
+INSERT INTO step_outputs (workflow_id, step_name, seq, kind, output, started_at, completed_at)
+VALUES ($1, $2, $3, 'COMPENSATION', NULL, now() - make_interval(secs => $4::float8), now())
+"""
+
+#: Every compensation is committed: the saga is fully reversed.
+#:
+#: ``error`` is pointedly absent from the SET list. It still holds the failure that sent the
+#: workflow here, and that is the single most useful thing to read off a COMPENSATED row
+#: afterwards -- clearing it would leave a successfully unwound saga with no record of what it
+#: was unwinding from.
+#:
+#: ``AND status = 'COMPENSATING'`` is part of the guard, not decoration: only an unwinding
+#: workflow can become COMPENSATED, so a row that moved on since it was claimed is untouchable.
+_FINISH_COMPENSATED_SQL = """
+UPDATE workflows
+SET status           = 'COMPENSATED',
+    owner_id         = NULL,
+    lease_expires_at = NULL,
+    updated_at       = now()
+WHERE id = $1 AND owner_id = $2 AND fencing_token = $3 AND status = 'COMPENSATING'
+"""
+
+#: The state a human has to resolve. Reached only when a compensation could not be made to
+#: succeed, which means money is committed somewhere it should not be and no automated path
+#: remains -- so this deliberately does NOT release the row back onto the queue in a claimable
+#: status. FAILED_DIRTY falls out of ``idx_workflows_claimable`` (001_core_schema.sql), so the
+#: row is terminal and no worker will pick it up and quietly try again.
+#:
+#: ``error`` IS replaced here, unlike in the COMPENSATED case: the compensation failure is now
+#: the actionable fact, and the original step failure is already in the logs.
+_FAIL_DIRTY_SQL = """
+UPDATE workflows
+SET status           = 'FAILED_DIRTY',
+    error            = $2,
+    owner_id         = NULL,
+    lease_expires_at = NULL,
+    updated_at       = now()
+WHERE id = $1 AND owner_id = $3 AND fencing_token = $4 AND status = 'COMPENSATING'
+"""
+
 #: Put a COMPENSATING workflow back on the queue, later, without changing what it is.
 #:
 #: ``status`` is pointedly absent from the SET list. The row is COMPENSATING and stays
 #: COMPENSATING -- this releases ownership and pushes ``run_after`` out, nothing more. The
-#: alternative would be a seventh status meaning "waiting for a compensator that does not
-#: exist yet", and the six are exactly six on purpose.
+#: alternative would be a seventh status meaning "waiting for a worker that can read this
+#: workflow's type", and the six are exactly six on purpose.
 #:
 #: ``AND status = 'COMPENSATING'`` is part of the ownership guard rather than decoration: it
 #: makes the statement unable to touch a row that has moved on since it was claimed.
@@ -299,23 +415,104 @@ async def begin_compensation(pool: asyncpg.Pool, own: Ownership, *, error: str) 
     return rows_affected(tag) > 0
 
 
+async def commit_compensation_output(
+    pool: asyncpg.Pool,
+    own: Ownership,
+    *,
+    step_name: str,
+    seq: int,
+    duration_seconds: float,
+) -> bool:
+    """Checkpoint one completed compensation, atomically with the workflow's position.
+
+    Exactly :func:`commit_step_output`'s shape, and for exactly its reasons. The undo's side
+    effect has already happened by the time this is called; this single write is what makes it
+    *durably undone*, so a crash one instruction later resumes the unwind without running the
+    compensation again.
+
+    The guarded UPDATE is taken first inside the transaction, before the INSERT, and that
+    order is load-bearing rather than stylistic: it proves ownership *and* takes the row lock,
+    so a concurrent claimer's ``FOR UPDATE SKIP LOCKED`` skips this row for the rest of the
+    transaction. A worker that has already been preempted therefore stops here having written
+    nothing, and can never reach the INSERT and collide on the ``step_outputs`` primary key.
+
+    Returns False if the guard matched zero rows -- preempted, or no longer COMPENSATING -- in
+    which case nothing is written and the whole thing rolls back together.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        tag = await conn.execute(
+            _CHECKPOINT_COMPENSATION_POSITION_SQL,
+            own.workflow_id,
+            step_name,
+            own.owner_id,
+            own.fencing_token,
+        )
+        if rows_affected(tag) == 0:
+            return False
+        await conn.execute(
+            _INSERT_COMPENSATION_OUTPUT_SQL,
+            own.workflow_id,
+            step_name,
+            seq,
+            duration_seconds,
+        )
+        return True
+
+
+async def finish_compensated(pool: asyncpg.Pool, own: Ownership) -> bool:
+    """Every compensation is checkpointed: mark the saga fully reversed and release the lease."""
+    tag = await pool.execute(
+        _FINISH_COMPENSATED_SQL, own.workflow_id, own.owner_id, own.fencing_token
+    )
+    return rows_affected(tag) > 0
+
+
+async def fail_dirty(pool: asyncpg.Pool, own: Ownership, *, error: str) -> bool:
+    """A compensation could not be made to succeed: park the workflow for a human.
+
+    Terminal on purpose. The row is released but lands in a status no dequeue query claims, so
+    nothing retries it automatically -- money is committed somewhere it should not be, the
+    engine has exhausted what it can do about that, and quietly cycling the row would hide it.
+    The committed ``kind = 'COMPENSATION'`` rows are the record of how far the unwind got.
+    """
+    tag = await pool.execute(
+        _FAIL_DIRTY_SQL, own.workflow_id, error, own.owner_id, own.fencing_token
+    )
+    return rows_affected(tag) > 0
+
+
 async def defer_compensation(
     pool: asyncpg.Pool, own: Ownership, *, delay_seconds: float
 ) -> bool:
-    """Release a COMPENSATING workflow back to the queue after ``delay_seconds``.
+    """Hand a COMPENSATING workflow back to the queue -- for **one** narrow reason.
 
-    For a worker that claimed an unwind it has no compensator for. It leaves the status, the
-    checkpoints and the error exactly as they are and only gives the row back -- the workflow
-    is not progressing, and pretending otherwise by writing a state would be a lie about it.
+    **Read this before deleting it as leftover.** An earlier build had a function of this name
+    that every COMPENSATING claim went through, because nothing could unwind a saga yet. That
+    stub is gone; :func:`~sankalp.engine.executor._compensate` replaced it and is what runs an
+    unwind now. This is a different thing wearing the same name, and it is reachable from
+    exactly one place: a worker that claimed a COMPENSATING row whose ``workflow_type`` its
+    build does not import, and which therefore cannot resolve the definition it would need to
+    know what the compensations even are.
 
-    The delay is what keeps this from becoming a busy loop: ``begin_compensation`` sets
-    ``run_after = now()`` so an unwind never sits out a backoff, which is right once something
-    can actually unwind it and merely means "immediately re-claimable" until then.
+    That is a fact about *this worker*, not about the workflow -- a rolling deploy, an old
+    binary, a definition module someone forgot to import. The honest response is to give the
+    row back untouched and let a worker that knows the type claim it. Note what the
+    alternatives cost:
+
+    * Raising instead would leave the row claimed until its lease expired, so the same
+      ignorant worker would pick it up again a lease later, and again, spinning on a workflow
+      it can never make progress on while ``begin_compensation``'s ``run_after = now()`` keeps
+      it permanently at the front of the queue.
+    * FAILED_DIRTY would page a human for a deployment that will fix itself in thirty seconds.
+    * Compensating "as best we can" is not available: without the definition there is no list
+      of compensations to run.
+
+    So this writes no status, no error, and no checkpoint. It releases ownership and pushes
+    ``run_after`` out by a jittered backoff, which is the only difference from doing nothing at
+    all -- and it is what keeps a partially-deployed fleet from busy-looping on the row.
 
     Returns False if the ownership guard matched zero rows, or if the workflow is no longer
     COMPENSATING -- either way somebody else has it and this worker must drop the work.
-
-    Phase 2 deletes this along with the executor branch that calls it.
     """
     tag = await pool.execute(
         _DEFER_COMPENSATION_SQL,

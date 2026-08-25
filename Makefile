@@ -2,7 +2,7 @@ PYTHON  ?= python
 COMPOSE ?= docker compose
 
 .DEFAULT_GOAL := help
-.PHONY: help install up down migrate test test-crash test-soak api worker logs psql psql-test clean
+.PHONY: help install up down migrate test test-crash test-unwind-crash test-gates test-soak api worker logs psql psql-test clean
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -23,8 +23,13 @@ migrate: ## Apply migrations/*.sql to both sankalp and sankalp_test
 test: migrate ## Run the suite against sankalp_test
 	SANKALP_ENVIRONMENT=test $(PYTHON) -m pytest
 
-test-crash: migrate ## Crash-recovery test, 20x loop
+test-crash: migrate ## Crash recovery mid-STEP, 20x loop
 	SANKALP_ENVIRONMENT=test $(PYTHON) -m pytest tests/test_crash.py --count=20
+
+test-unwind-crash: migrate ## Crash recovery mid-COMPENSATION, 20x loop
+	SANKALP_ENVIRONMENT=test $(PYTHON) -m pytest tests/test_compensation_crash.py --count=20
+
+test-gates: test-crash test-unwind-crash ## Both crash gates, 20x each
 
 test-soak: migrate ## Soak: 1000 workflows with workers being killed
 	SANKALP_ENVIRONMENT=test $(PYTHON) -m pytest -m slow

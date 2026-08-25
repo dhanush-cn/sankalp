@@ -46,6 +46,21 @@ class Settings(BaseSettings):
     environment: Environment = "dev"
     log_level: str = "INFO"
 
+    # The crash gates (workflows/_instrumentation.py) let a test hold a step or a compensation
+    # open until it inserts a crash_gates row, so a SIGKILL lands at a chosen instant. The
+    # demo workflows that use them are imported by every worker -- workflows/__init__.py is
+    # what registers definitions -- so the mechanism is reachable from a production process.
+    #
+    # It therefore takes TWO independent facts to arm, and this flag is only one of them:
+    # `Settings.crash_gate_armed` also requires environment == "test". A single leaked env var
+    # must not be able to make a real compensation block on a row that will never arrive; that
+    # is a stuck unwind with money in limbo, and it would look like a hung worker rather than
+    # like a misconfiguration.
+    crash_gate_enabled: bool = Field(
+        default=False,
+        description="Half of the crash-gate arming condition. Requires environment='test' too.",
+    )
+
     # ---- Postgres -----------------------------------------------------------
     database_url: PostgresDsn = Field(
         default="postgresql://sankalp:sankalp@localhost:5432/sankalp",
@@ -93,6 +108,18 @@ class Settings(BaseSettings):
 
     # ---- Retry / backoff ----------------------------------------------------
     max_attempts: int = Field(default=5, ge=1)
+    # The unwind's own retry budget, deliberately tighter than max_attempts and
+    # deliberately not the same counter. A forward retry is spent across re-claims:
+    # the row goes back to the queue, costs nothing while it waits, and
+    # workflows.attempt records it. These attempts are spent inside a single claim,
+    # holding a lease and a concurrency slot through every backoff -- so they are
+    # counted in memory, workflows.attempt is left alone (its forward history stays
+    # intact for debugging), and a crash mid-unwind does not consume the budget.
+    compensation_max_attempts: int = Field(
+        default=3,
+        ge=1,
+        description="Tries for one compensation before the workflow goes FAILED_DIRTY.",
+    )
     backoff_cap_seconds: int = Field(
         default=60,
         ge=1,
@@ -171,6 +198,22 @@ class Settings(BaseSettings):
     @property
     def lease_renew_interval_seconds(self) -> float:
         return self.lease_duration_seconds / self.lease_renew_divisor
+
+    @property
+    def crash_gate_armed(self) -> bool:
+        """Whether a crash gate may block. Requires BOTH facts, never either alone.
+
+        ``crash_gate_enabled`` is deliberately not sufficient. The demo workflows are imported
+        by every worker process, so an env var that leaked into a production deployment would
+        otherwise be able to park a compensation on a ``crash_gates`` row that no test is ever
+        going to insert -- an unwind stopped mid-flight with money committed on one side of it.
+
+        Requiring ``environment == "test"`` as well means arming the gate takes a deliberate,
+        visible statement that this process is a test process. ``environment`` also decides
+        which database the worker connects to (:attr:`active_database_url`), so a process that
+        satisfies this is by construction pointed at ``sankalp_test``.
+        """
+        return self.environment == "test" and self.crash_gate_enabled
 
 
 @lru_cache(maxsize=1)

@@ -656,23 +656,26 @@ async def test_an_unregistered_workflow_type_leaves_the_row_untouched(
 
 
 # ---------------------------------------------------------------------------
-# A COMPENSATING workflow must not be run forward. PHASE 1 ONLY -- these tests
-# change shape when Phase 2 wires a real compensator.
+# A COMPENSATING workflow runs backwards, never forwards.
 #
-# The unwind is deliberately claimable with no backoff, and Phase 2 is what claims
-# it. Until then this worker is the only thing that ever picks such a row up, so
-# refusing it is the only thing standing between a failed saga and being replayed
-# forward on every claim.
+# The unwind is claimable by the same dequeue query as everything else, deliberately
+# with no backoff, and arrives at execute_workflow as an ordinary ClaimedWorkflow.
+# The dispatch on claimed.status is the only thing standing between a failed saga
+# and being replayed forward on every claim.
+#
+# What the unwind then does is tests/test_compensation.py's subject. These two are
+# about the dispatch itself.
 # ---------------------------------------------------------------------------
 
 
-async def test_a_compensating_claim_is_deferred_without_running_any_step(
+async def test_a_compensating_claim_runs_the_unwind_and_never_a_forward_step(
     pool, insert_workflow, settings
 ):
     """The step that failed must not be invoked again just because the row was re-claimed.
 
     Re-running it is a second side effect on a workflow that is already being unwound -- and
-    the step is being unwound precisely because it must not stand.
+    the step is being unwound precisely because it must not stand. This row has no committed
+    checkpoints, so the correct unwind is the empty one: reverse nothing, land COMPENSATED.
     """
     workflow_id = await insert_workflow(status="COMPENSATING")
     calls: list[str] = []
@@ -680,16 +683,13 @@ async def test_a_compensating_claim_is_deferred_without_running_any_step(
 
     result = await execute_workflow(pool, await claim_one(pool), settings=settings)
 
-    assert result is ExecutionResult.COMPENSATION_DEFERRED
-    assert calls == [], f"a COMPENSATING claim invoked {calls}; it must invoke nothing"
+    assert result is ExecutionResult.COMPENSATED
+    assert calls == [], f"a COMPENSATING claim invoked {calls}; it must invoke no forward step"
 
     final = await row(pool, workflow_id)
-    assert final["status"] == "COMPENSATING", "the row must stay COMPENSATING, not move on"
-    assert final["owner_id"] is None, "ownership must be released so Phase 2 can claim it"
+    assert final["status"] == "COMPENSATED", "the row must be unwound, not run forward"
+    assert final["owner_id"] is None
     assert final["lease_expires_at"] is None
-    # Pushed into the future, which is what turns "immediately re-claimable" into a backoff
-    # instead of a worker spinning on this row for as long as Phase 2 does not exist.
-    assert final["run_after"] > await pool.fetchval("SELECT now()")
 
 
 async def test_a_step_that_recovers_cannot_promote_a_compensating_workflow_to_success(
@@ -697,22 +697,29 @@ async def test_a_step_that_recovers_cannot_promote_a_compensating_workflow_to_su
 ):
     """The dangerous one: fail terminally, then succeed on the next attempt.
 
-    Without the refusal the re-claim replays step 1 from its checkpoint, re-runs step 2 --
-    which now works -- runs step 3, and calls finish_success. The workflow reports SUCCESS
-    while the side effects it was unwinding were never unwound. Money moved and the row says
-    everything is fine.
+    Without the dispatch the re-claim replays step 1 from its checkpoint, re-runs step 2 --
+    which now works -- and calls finish_success. The workflow reports SUCCESS while the side
+    effects it was unwinding were never unwound. Money moved and the row says everything is
+    fine. With it, step 1 is *reversed* instead and step 2 is never reached.
     """
     workflow_id = await insert_workflow()
     failure: list[Exception | None] = [TerminalError("rejected")]
+    calls: list[str] = []
 
     @workflow(WORKFLOW_TYPE)
     class Flaky:
         @step(seq=1)
         async def debit_wallet(self, ctx: StepContext) -> dict[str, bool]:
+            calls.append("debit_wallet")
             return {"debited": True}
+
+        @debit_wallet.compensate
+        async def refund_wallet(self, ctx: StepContext, forward_output: dict) -> None:
+            calls.append("refund_wallet")
 
         @step(seq=2)
         async def call_gateway(self, ctx: StepContext) -> dict[str, bool]:
+            calls.append("call_gateway")
             if failure[0] is not None:
                 raise failure[0]
             return {"charged": True}
@@ -722,17 +729,22 @@ async def test_a_step_that_recovers_cannot_promote_a_compensating_workflow_to_su
         ExecutionResult.COMPENSATING
     )
     assert (await row(pool, workflow_id))["status"] == "COMPENSATING"
+    assert calls == ["debit_wallet", "call_gateway"]
+    calls.clear()
 
     # Attempt 2: the condition has cleared, so the step would now succeed.
     failure[0] = None
     result = await execute_workflow(pool, await claim_one(pool, owner="worker-b"),
                                     settings=settings)
 
-    assert result is ExecutionResult.COMPENSATION_DEFERRED
+    assert result is ExecutionResult.COMPENSATED
     final = await row(pool, workflow_id)
-    assert final["status"] == "COMPENSATING", (
+    assert final["status"] == "COMPENSATED", (
         f"status is {final['status']!r}: a workflow being unwound was promoted past its "
         "compensation because a later attempt of the failing step happened to work."
+    )
+    assert calls == ["refund_wallet"], (
+        f"the re-claim ran {calls}; it must reverse step 1 and never re-invoke step 2"
     )
     assert "call_gateway" not in await checkpoints(pool, workflow_id)
 
@@ -750,6 +762,40 @@ async def test_finish_success_refuses_a_workflow_that_is_not_running(pool, inser
     own = workflow_writes.Ownership.of(claimed)
     assert await workflow_writes.finish_success(pool, own, output_json="{}") is False
     assert (await row(pool, workflow_id))["status"] == "COMPENSATING"
+
+
+async def test_an_unwind_this_build_cannot_read_is_handed_back_rather_than_raised(
+    pool, insert_workflow, settings
+):
+    """The one case defer_compensation still exists for -- and why it is not the forward rule.
+
+    A forward run of an unresolvable type raises and keeps its claim (the test above): the row
+    waits out its lease and nothing is lost. An unwind cannot do that. ``begin_compensation``
+    set ``run_after = now()`` so an unwind never sits out a backoff, which means this same
+    ignorant worker would re-claim it the moment its lease expired, and every lease after
+    that, spinning forever on a workflow it can never make progress on.
+    """
+    workflow_id = await insert_workflow(
+        status="COMPENSATING", workflow_type="type_this_build_never_heard_of"
+    )
+    define_transfer([])
+
+    result = await execute_workflow(pool, await claim_one(pool), settings=settings)
+
+    assert result is ExecutionResult.COMPENSATION_DEFERRED
+    final = await row(pool, workflow_id)
+    assert final["status"] == "COMPENSATING", "handing the row back must not change what it is"
+    assert final["owner_id"] is None, "ownership is released so a worker that knows the type"
+    assert final["lease_expires_at"] is None
+    assert final["error"] is None, (
+        "this is a fact about the worker, not a failure of the workflow -- writing an error "
+        "would blame the saga for a deployment gap"
+    )
+    assert final["run_after"] > await pool.fetchval("SELECT now()"), (
+        "pushed out by a jittered backoff, which is the only thing stopping a fleet that "
+        "cannot read this type from busy-looping on the row"
+    )
+    assert await checkpoints(pool, workflow_id) == {}
 
 
 async def test_defer_compensation_is_ownership_guarded(pool, insert_workflow):

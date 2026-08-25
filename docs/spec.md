@@ -128,8 +128,9 @@ FROM (
     FROM workflows
     WHERE run_after <= now()
       AND (
-            status IN ('PENDING', 'COMPENSATING')
-            OR (status = 'RUNNING' AND lease_expires_at < now())
+            status = 'PENDING'
+            OR (status IN ('RUNNING', 'COMPENSATING')
+                AND (lease_expires_at IS NULL OR lease_expires_at < now()))
           )
     ORDER BY run_after
     FOR UPDATE SKIP LOCKED
@@ -139,11 +140,12 @@ WHERE w.id = claimed.id
 RETURNING w.*;
 ```
 
-Three things doing real work here:
+Four things doing real work here:
 
 - `FOR UPDATE SKIP LOCKED` — N workers poll simultaneously and never collide. Without it they all grab row 1 and serialize.
-- `status = 'RUNNING' AND lease_expires_at < now()` — this *is* the crash recovery. There's no separate recovery daemon; a dead worker's rows simply become claimable again. Fewer moving parts, fewer bugs.
-- `ORDER BY run_after` inside the subquery — the scan is bounded by the partial index.
+- `lease_expires_at < now()` on `RUNNING` — this *is* the crash recovery. There's no separate recovery daemon; a dead worker's rows simply become claimable again. Fewer moving parts, fewer bugs.
+- **`COMPENSATING` obeys the lease too, and `lease_expires_at IS NULL` is what keeps it immediately claimable.** The framing to hold onto: *a COMPENSATING row with a live lease is an owned row being actively unwound.* It is not a queue entry waiting for someone — it is work in progress, exactly like a `RUNNING` row is, and it gets identical ownership protection. Forward and backward execution are the same kind of thing here: a worker holds the row, does side effects, checkpoints them, and nobody else may touch it while it does. The row becomes re-claimable for exactly one reason, the same one as forward — the owner's lease expired, i.e. the unwinding worker died — and recovery is then the same path: another worker claims it and resumes from the last committed checkpoint, which for an unwind means the first step with no `kind='COMPENSATION'` row. One ownership rule, one recovery mechanism, both directions. An earlier revision of this query had `status IN ('PENDING','COMPENSATING')` as one unconditional branch, so a COMPENSATING row was claimable *no matter who held it*. That is invisible until something actually unwinds a saga — a build whose compensator was a stub released such rows in milliseconds — and then it is severe: a worker running an unwind is re-claimed out from under itself on the very next poll. Measured on one worker at a 50 ms poll interval, a single workflow reached `fencing_token = 4` and ran the same compensation three times concurrently. Fencing still keeps *effects* exactly-once, because only one checkpoint commits — but every racing worker has already *executed* the compensation's side effect by the time its write is rejected, so the duplicate refunds are absorbed by nothing except the compensation's own idempotency. `begin_compensation` sets `owner_id = NULL, lease_expires_at = NULL, run_after = now()`, so the `IS NULL` branch preserves the property that matters — an unwind never sits out a backoff — while a lease that *is* held excludes everyone else for its duration.
+- `ORDER BY run_after` inside the subquery — the scan is bounded by the partial index. Note the index predicate (`status IN ('PENDING','RUNNING','COMPENSATING')`) stays a superset of this filter, so no migration is needed and the planner can still prove the index applies.
 
 ## Execution Flow
 
