@@ -80,6 +80,11 @@ class Settings(BaseSettings):
 
     # ---- Redis --------------------------------------------------------------
     redis_url: RedisDsn = Field(default="redis://localhost:6379/0")
+    # Bounds how long a stuck XADD can hold a claim transaction's row locks (and its xmin
+    # horizon) open. FOR UPDATE SKIP LOCKED locks live exactly as long as the drain's
+    # transaction does, so a hung Redis without this would pin vacuum on `outbox`, a table
+    # 003_saga.sql already flags as high-churn.
+    outbox_redis_timeout_seconds: float = Field(default=5.0, gt=0)
 
     # ---- Worker / queue -----------------------------------------------------
     worker_id: str = Field(
@@ -129,6 +134,18 @@ class Settings(BaseSettings):
     # ---- Outbox -------------------------------------------------------------
     outbox_batch_size: int = Field(default=100, ge=1)
     outbox_poll_interval_seconds: float = Field(default=0.2, gt=0)
+    outbox_stream: str = Field(
+        default="sankalp.events",
+        description="Redis Stream key the drain XADDs to.",
+    )
+    # No persistence on the Redis container (docker-compose.yml: --save "" --appendonly no) --
+    # the stream is transport, not storage, and MAXLEN keeps it from growing without bound.
+    # The ~ makes it approximate (Redis trims lazily, on whole macro-nodes) so XADD does not
+    # pay for an exact trim on every call.
+    outbox_stream_maxlen: int = Field(default=100_000, ge=1)
+    # Whether run_worker() also starts a DrainLoop as a sibling task, sharing the worker's
+    # pool. False runs the drain only via `python -m sankalp.engine.drain` / `make drain`.
+    outbox_drain_in_worker: bool = Field(default=True)
 
     # ---- API ----------------------------------------------------------------
     api_host: str = "0.0.0.0"

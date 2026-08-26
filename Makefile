@@ -2,7 +2,7 @@ PYTHON  ?= python
 COMPOSE ?= docker compose
 
 .DEFAULT_GOAL := help
-.PHONY: help install up down migrate test test-crash test-unwind-crash test-gates test-soak api worker logs psql psql-test clean
+.PHONY: help install up down migrate test test-crash test-unwind-crash test-drain-crash test-gates test-soak api worker drain logs psql psql-test clean
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -29,7 +29,10 @@ test-crash: migrate ## Crash recovery mid-STEP, 20x loop
 test-unwind-crash: migrate ## Crash recovery mid-COMPENSATION, 20x loop
 	SANKALP_ENVIRONMENT=test $(PYTHON) -m pytest tests/test_compensation_crash.py --count=20
 
-test-gates: test-crash test-unwind-crash ## Both crash gates, 20x each
+test-drain-crash: migrate ## Crash recovery mid-outbox-publish (between XADD and the mark), 20x loop
+	SANKALP_ENVIRONMENT=test $(PYTHON) -m pytest tests/test_drain_crash.py --count=20
+
+test-gates: test-crash test-unwind-crash test-drain-crash ## All three crash gates, 20x each
 
 test-soak: migrate ## Soak: 1000 workflows with workers being killed
 	SANKALP_ENVIRONMENT=test $(PYTHON) -m pytest -m slow
@@ -37,8 +40,11 @@ test-soak: migrate ## Soak: 1000 workflows with workers being killed
 api: ## Dev API server against the sankalp database
 	$(PYTHON) -m uvicorn sankalp.api.main:app --reload --host 0.0.0.0 --port 8000
 
-worker: ## Run one worker process against the sankalp database
+worker: ## Run one worker process against the sankalp database (also drains the outbox; see SANKALP_OUTBOX_DRAIN_IN_WORKER)
 	$(PYTHON) -m sankalp.engine.worker
+
+drain: ## Run the outbox drain as its own process against the sankalp database
+	$(PYTHON) -m sankalp.engine.drain
 
 logs: ## Tail container logs
 	$(COMPOSE) logs -f --tail=100

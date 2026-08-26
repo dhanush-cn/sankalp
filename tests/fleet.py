@@ -53,9 +53,16 @@ POLL_SECONDS = 0.02
 
 
 class WorkerFleet:
-    """Real ``python -m sankalp.engine.worker`` processes, and the log tails to explain them.
+    """Real subprocesses, and the log tails to explain them when a gate fails.
 
-    Output goes to temporary files rather than ``subprocess.PIPE``: a worker logs on every
+    Named for its original and still primary job -- ``python -m sankalp.engine.worker``
+    processes -- but ``launch`` takes ``module`` and ``ready_marker`` so
+    ``tests/test_drain_crash.py`` can spawn ``python -m sankalp.engine.drain`` through the same
+    mechanism instead of duplicating it: fixed argv, a readiness check so a process that dies
+    on import is reported as that rather than as a mysterious timeout, and a kill that refuses
+    any pid this harness did not spawn.
+
+    Output goes to temporary files rather than ``subprocess.PIPE``: a process logs on every
     claim and every recovery, and nothing in these tests reads the pipes while it waits, so a
     PIPE would fill its buffer and block the child -- stalling the very process whose liveness
     is under test.
@@ -69,13 +76,27 @@ class WorkerFleet:
     def pids(self) -> set[int]:
         return set(self._procs)
 
-    def launch(self, count: int = WORKER_COUNT) -> None:
-        """Start ``count`` workers and block until each has reached its polling loop."""
+    def launch(
+        self,
+        count: int = WORKER_COUNT,
+        *,
+        module: str = "sankalp.engine.worker",
+        ready_marker: str = "polling:",
+        extra_env: dict[str, str] | None = None,
+    ) -> None:
+        """Start ``count`` processes and block until each has logged ``ready_marker``.
+
+        Safe to call more than once on the same fleet -- readiness is awaited only for the
+        processes started by *this* call, never for ones a previous call already confirmed
+        (and possibly this test has since killed on purpose, which would otherwise read as a
+        process that "exited before it started").
+        """
+        new_pids: list[int] = []
         for index in range(count):
             handle, path = tempfile.mkstemp(prefix=f"crash-worker-{index}-", suffix=".log")
             proc = subprocess.Popen(  # noqa: S603 - fixed argv, never shell=True
-                [sys.executable, "-m", "sankalp.engine.worker"],
-                env=self._env(index),
+                [sys.executable, "-m", module],
+                env=self._env(index, extra_env),
                 cwd=REPO_ROOT,
                 stdout=handle,
                 stderr=subprocess.STDOUT,
@@ -83,14 +104,15 @@ class WorkerFleet:
             os.close(handle)
             self._procs[proc.pid] = proc
             self._logs[proc.pid] = Path(path)
-        self._await_ready()
+            new_pids.append(proc.pid)
+        self._await_ready(new_pids, ready_marker)
 
     @staticmethod
-    def _env(index: int) -> dict[str, str]:
+    def _env(index: int, extra_env: dict[str, str] | None = None) -> dict[str, str]:
         return {
             **os.environ,
             # The suite's own guard (config.py validates the name ends in _test) plus this is
-            # what keeps a worker that claims real work pointed at sankalp_test: create_pool
+            # what keeps a process that claims real work pointed at sankalp_test: create_pool
             # resolves active_database_url from it.
             "SANKALP_ENVIRONMENT": "test",
             # The crash gates fail safe and need BOTH facts to arm (config.py,
@@ -101,35 +123,42 @@ class WorkerFleet:
             "SANKALP_CRASH_GATE_ENABLED": "1",
             # owner_id must be unique per process -- it is half of every ownership guard, so
             # two workers sharing one would each accept the other's writes as their own.
+            # Harmless, if unused, for a process (the drain) that has no ownership guard.
             "SANKALP_WORKER_ID": f"crash-worker-{index}-{uuid.uuid4().hex[:8]}",
             "SANKALP_LEASE_DURATION_SECONDS": str(LEASE_SECONDS),
             "SANKALP_POLL_INTERVAL_SECONDS": "0.05",
+            "SANKALP_OUTBOX_POLL_INTERVAL_SECONDS": "0.05",
+            # A worker also drains by default (config.py, outbox_drain_in_worker); off here so
+            # a worker-fleet test's outbox rows are not raced by a drain this fleet did not ask
+            # for, and so a drain-fleet test's gate is never satisfied by the wrong process.
+            "SANKALP_OUTBOX_DRAIN_IN_WORKER": "0",
             "SANKALP_LOG_LEVEL": "INFO",
+            **(extra_env or {}),
         }
 
-    def _await_ready(self) -> None:
-        """Wait for every worker to log that it is polling, or fail with its output.
+    def _await_ready(self, pids: list[int], ready_marker: str) -> None:
+        """Wait for the given processes to log ``ready_marker``, or fail with their output.
 
-        A worker that dies on import would otherwise show up much later as an unexplained
-        timeout waiting for a workflow nobody ever claimed.
+        A process that dies on import would otherwise show up much later as an unexplained
+        timeout waiting for work nobody ever claimed.
         """
         deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
-        pending = set(self._procs)
+        pending = set(pids)
         while pending:
             for pid in list(pending):
                 proc = self._procs[pid]
                 if proc.poll() is not None:
                     raise AssertionError(
-                        f"worker pid {pid} exited with {proc.returncode} before it started "
-                        f"polling.{self.diagnostics()}"
+                        f"process pid {pid} exited with {proc.returncode} before it logged "
+                        f"{ready_marker!r}.{self.diagnostics()}"
                     )
-                if "polling:" in self._read(pid):
+                if ready_marker in self._read(pid):
                     pending.discard(pid)
             if not pending:
                 return
             if time.monotonic() >= deadline:
                 raise AssertionError(
-                    f"workers {sorted(pending)} did not start polling within "
+                    f"processes {sorted(pending)} did not log {ready_marker!r} within "
                     f"{STARTUP_TIMEOUT_SECONDS:.0f}s.{self.diagnostics()}"
                 )
             time.sleep(POLL_SECONDS)

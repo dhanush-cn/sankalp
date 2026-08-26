@@ -24,6 +24,7 @@ import pytest
 from fleet import WorkerFleet
 
 from sankalp.config import get_settings
+from sankalp.storage.redis import create_redis
 
 #: Truncated before every test. step_outputs is listed explicitly even though it would go
 #: via CASCADE, so the intent survives someone dropping the FK -- and the crash gate's three
@@ -200,6 +201,34 @@ def workers(truncate_tables: None) -> Iterator[WorkerFleet]:
         yield fleet
     finally:
         fleet.shutdown()
+
+
+@pytest.fixture
+async def redis_client() -> AsyncIterator[Any]:
+    """A Redis client for the outbox drain's tests, closed at teardown."""
+    client = create_redis()
+    try:
+        yield client
+    finally:
+        await client.aclose()
+
+
+@pytest.fixture
+async def event_stream(redis_client: Any) -> AsyncIterator[str]:
+    """A Redis Stream key unique to this test, deleted at teardown.
+
+    This is the isolation mechanism for outbox drain tests, and deliberately not a
+    ``test_redis_url`` analogous to :attr:`Settings.test_database_url`'s ``_test`` guard: a
+    truncate is destructive to anything already in the database it points at, so that fixture
+    needs a check that stops it from running against the wrong one. An ``XADD`` to a key no
+    other test uses cannot damage anything it does not itself own, so the unique key *is* the
+    guard -- there is nothing left for a second one to protect against.
+    """
+    stream = f"sankalp.events.test.{uuid.uuid4().hex}"
+    try:
+        yield stream
+    finally:
+        await redis_client.delete(stream)
 
 
 @pytest.fixture

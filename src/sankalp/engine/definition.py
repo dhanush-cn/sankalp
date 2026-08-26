@@ -35,6 +35,7 @@ re-execute the step; pass ``name=`` to keep the persisted identity while renamin
 from __future__ import annotations
 
 import inspect
+import json
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -43,6 +44,7 @@ from typing import Any, TypeVar
 from uuid import UUID
 
 from sankalp.engine.errors import RetryableError, TerminalError, WorkflowDefinitionError
+from sankalp.storage.outbox import PendingEvent
 
 __all__ = [
     "StepContext",
@@ -90,6 +92,10 @@ class StepContext:
     ``fencing_token`` is passed through to every ownership-scoped write (``WHERE id = $1 AND
     owner_id = $2 AND fencing_token = $3``). A step that talks to a resource guard hands it
     over so a stalled worker holding an older token cannot act after being preempted.
+
+    ``emit`` buffers events that the engine writes in the *same transaction* as this step's
+    checkpoint -- see :meth:`emit`. One context is built per attempt, and the commit that
+    consumes the buffer empties it.
     """
 
     workflow_id: UUID
@@ -105,6 +111,74 @@ class StepContext:
     renew_lease_callback: Callable[[], Awaitable[None]] | None = field(
         default=None, repr=False, compare=False
     )
+
+    #: Events emitted by this attempt, waiting for its checkpoint transaction. A mutable list
+    #: on a frozen dataclass is fine and intended: the attribute is never rebound, only the
+    #: list it points at is appended to and cleared.
+    #:
+    #: Excluded from ``repr`` and ``compare`` for the same reason as the callback above -- it
+    #: is engine plumbing, not part of what a context *is*, and two contexts do not stop being
+    #: equal because one of them has emitted something.
+    _pending_events: list[PendingEvent] = field(
+        default_factory=list, repr=False, compare=False
+    )
+
+    def emit(self, event_type: str, payload: Mapping[str, Any] | None = None) -> None:
+        """Buffer an event to be written in the SAME transaction as this step's checkpoint.
+
+        This is the transactional outbox, and the atomicity is the entire point: the engine
+        does not publish anything here and does not talk to a broker at all. It appends the
+        event to ``outbox`` in the one transaction that also writes ``step_outputs`` and moves
+        the workflow's position, so the event and the state change that caused it become true
+        together or not at all. A separate drain loop moves committed rows to Redis afterwards.
+
+        Nothing is written if the step goes on to fail, or if this worker turns out to have
+        been preempted -- the checkpoint transaction rolls back and takes the events with it.
+        That is what stops an event describing a step whose effects were never recorded.
+
+        The payload is serialised **now**, so a value that cannot be encoded raises here, with
+        a traceback pointing at the step that emitted it. Deferring it to commit time would
+        surface the failure inside a shielded write with no indication of which buffered event
+        was the bad one. Terminal rather than retryable for the same reason as
+        ``executor._encode_output``: a retry re-encodes the same object and fails identically.
+        """
+        try:
+            payload_json = json.dumps(dict(payload) if payload is not None else {})
+        except (TypeError, ValueError) as exc:
+            raise TerminalError(
+                f"event {event_type!r} emitted by step {self.step_name!r} of workflow "
+                f"{self.workflow_id} has a payload that is not JSON-serialisable ({exc}). "
+                "An event payload is persisted to outbox.payload (JSONB) and read by a "
+                "different process later -- emit plain JSON types"
+            ) from exc
+        self._pending_events.append(
+            # trace_context stays None until Phase 4 wires the W3C traceparent through
+            # (docs/spec.md, "Trace Context Propagation"). The column and this field exist so
+            # that work is a change at this one line rather than a schema migration.
+            PendingEvent(event_type=event_type, payload_json=payload_json)
+        )
+
+    def take_pending_events(self) -> list[PendingEvent]:
+        """Hand over the buffered events and empty the buffer. Called by the engine, once.
+
+        Emptying is what makes double-emission unrepresentable rather than merely unlikely.
+        The buffer is reachable no other way, so a second commit against this context can only
+        ever find it empty -- and that stays true even if some later refactor hoists the
+        per-attempt ``_context_for`` call out of the executor's loop, which is exactly the
+        edit that would otherwise start shipping every event twice.
+        """
+        taken = list(self._pending_events)
+        self._pending_events.clear()
+        return taken
+
+    def discard_pending_events(self) -> None:
+        """Throw away anything buffered so far, without committing it.
+
+        For a retry that reuses this context: the unwind runs a compensation up to
+        ``compensation_max_attempts`` times against one ``StepContext``, and events buffered by
+        an attempt that then failed must not ride along with the attempt that succeeds.
+        """
+        self._pending_events.clear()
 
     async def renew_lease(self) -> None:
         """Push this workflow's lease further out; call it from inside a long step.

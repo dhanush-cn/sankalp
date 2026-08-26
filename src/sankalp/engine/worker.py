@@ -373,14 +373,50 @@ class Worker:
 
 
 async def run_worker(settings: Settings | None = None) -> None:
-    """Open a pool, run one worker until it is asked to stop, close the pool."""
+    """Open a pool, run one worker until it is asked to stop, close the pool.
+
+    When ``settings.outbox_drain_in_worker`` is set (the default), an
+    :class:`~sankalp.engine.drain.DrainLoop` runs as a sibling task on the same pool for the
+    life of this process, so a single ``sankalp-worker`` both executes workflows and publishes
+    their events without a second process to deploy. Set it to ``False`` to run the drain only
+    via ``sankalp-drain`` / ``make drain`` instead.
+
+    Shutdown order here is load-bearing. The drain is stopped and awaited, and the Redis
+    client it was publishing through is closed, *before* the pool closes -- the drain borrows
+    this pool, so closing the pool first would pull it out from under a batch still in flight.
+    A drain task that dies on its own (an exception escaping ``DrainLoop.run``, which should
+    not happen -- see its docstring) is logged loudly rather than silently: the worker would
+    otherwise keep executing workflows and polling looking perfectly healthy while every event
+    they emit quietly stops reaching Redis.
+    """
     from sankalp.storage.pool import create_pool
 
     settings = settings or get_settings()
     pool = await create_pool(settings=settings)
+    drain_task: asyncio.Task[None] | None = None
+    redis = None
+    if settings.outbox_drain_in_worker:
+        from sankalp.engine.drain import DrainLoop
+        from sankalp.engine.publisher import RedisStreamPublisher
+        from sankalp.storage.redis import create_redis
+
+        redis = create_redis(settings=settings)
+        publisher = RedisStreamPublisher(
+            redis, stream=settings.outbox_stream, maxlen=settings.outbox_stream_maxlen
+        )
+        drain_loop = DrainLoop(pool, publisher, settings=settings)
+        drain_task = asyncio.create_task(drain_loop.run(), name="outbox-drain")
     try:
         await Worker(pool, settings=settings).run()
     finally:
+        if drain_task is not None:
+            drain_loop.stop()
+            try:
+                await drain_task
+            except Exception:
+                log.exception("outbox drain task failed; events stopped being published")
+        if redis is not None:
+            await redis.aclose()
         await pool.close()
 
 

@@ -311,7 +311,125 @@ gate is a no-op that logs loudly.
 
 ---
 
-## 6. The interview answers banked this phase
+## 6. The transactional outbox: producer and drain
+
+The table and its rationale shipped with `003_saga.sql`; nothing wrote to it or read from it.
+This closes that gap in two halves that deliberately solve different problems.
+
+### The producer half: one transaction, made real
+
+`StepContext.emit(event_type, payload)` buffers events on the context a step or compensation
+is running under. Nothing is written to `outbox` at `emit()` time — the payload is only
+serialised there, eagerly, so a value that cannot be encoded raises with a traceback pointing
+at the step that emitted it rather than surfacing later inside a shielded commit with no way
+to tell which buffered event was the bad one.
+
+The write happens in `storage/workflows.py::commit_step_output` /
+`commit_compensation_output`, which already opened the one transaction the checkpoint needs.
+The `INSERT INTO outbox` joins it, after the ownership-guarded `UPDATE workflows` that takes
+the row lock — so a preempted worker returns having written nothing, and "nothing" now
+includes its events. That single fact is the entire answer to the dual-write problem: either
+the state change and its event both exist, or neither does. There is no third case to reason
+about, which is the whole point of putting them in one transaction instead of two writes in
+some careful order.
+
+**The retry wrinkle, and why it needed two different fixes.** A forward retry and a
+compensation retry look similar from the outside — both re-run something that failed — but
+they arrive at the event buffer completely differently, and treating them the same would have
+been wrong in one direction or the other:
+
+- A forward retry releases the row (`schedule_retry`) and returns; the next attempt is an
+  entirely new claim, building a fresh `StepContext` from scratch. The buffer is safe here by
+  construction — but only as an accident of control flow, which is why
+  `StepContext.take_pending_events()` also *empties* the buffer on every call. A second commit
+  against the same context can then only ever find it empty, which keeps the property true
+  even if some future refactor hoists the per-attempt context construction out of the
+  executor's loop and this accident stops holding.
+- A compensation retry is not like that at all: `_run_compensation` retries **in place**,
+  against the *same* `StepContext`, up to `compensation_max_attempts` times. Without an
+  explicit `ctx.discard_pending_events()` at the top of each attempt, an attempt that emitted
+  and then failed would leave its events sitting in the buffer, and the attempt that finally
+  succeeds would commit them alongside its own — one undo, two events. This is not a corner
+  case; it is the *ordinary* shape of a compensation retry, so leaving it unhandled would have
+  meant a duplicate on every recovered compensation failure, not just an unlucky crash.
+
+Both are proved directly: a step that emits, fails retryably, then succeeds on a second real
+claim produces exactly one `outbox` row (`test_a_retried_step_emits_one_event_not_two`); a
+compensation that fails once and succeeds on retry produces exactly one
+(`test_a_failed_compensation_attempt_does_not_ship_its_events_twice`). Removing either guard
+was run and observed to fail before being restored — see the table below.
+
+### The drain half: a different problem, an honestly different guarantee
+
+There is no state change for the drain to be atomic with — only a broker that might be down.
+So the drain does not try to extend the producer's atomicity across a process boundary; it
+gives up exactly-once *delivery* and keeps exactly-once *effects*, stated plainly rather than
+implied: `SELECT ... FOR UPDATE SKIP LOCKED`, publish, `UPDATE ... SET published_at`, all
+inside one transaction. A crash between the publish and the mark republishes the batch — the
+row is still `published_at IS NULL` — and the only thing that makes that survivable is that
+consumers dedupe on `event_id` (`OutboxEvent.id`, i.e. `outbox.id`), which is deliberately
+*not* the Redis stream entry ID: a republish gets a fresh stream ID every time, which is
+exactly why a separate, stable identifier has to ride along in the payload.
+
+**Why the Postgres transaction stays open across the `XADD`.** `FOR UPDATE SKIP LOCKED` locks
+live exactly as long as their transaction does. Commit before publishing and a second drainer
+claims the same rows in the gap and double-publishes on the very first pass — no crash
+required, no race window to get unlucky in, it simply happens. Holding the transaction open is
+what makes N concurrent drainers safe (proved directly:
+`test_two_concurrent_drainers_do_not_double_publish` drives two claims against genuinely
+separate connections and asserts the claimed id sets are disjoint), and it is also the
+operational cost worth naming rather than discovering later: a Redis call that never returns
+pins that transaction — and its `xmin` horizon — open indefinitely, on a table `003_saga.sql`
+already flags as high-churn. `storage/redis.py` bounds this with a socket timeout
+(`outbox_redis_timeout_seconds`), and `outbox_batch_size` bounds how much work sits behind any
+one lock.
+
+**A self-deadlock found and fixed during this work, worth recording because it will look
+obviously wrong in hindsight and wasn't.** The first version of `drain_once` recorded a failed
+publish's `attempts` count from *inside* the `except` block, while the claim's transaction was
+still open — i.e. from a second pool connection, while the first was still holding
+`FOR UPDATE` locks on the very rows that second connection's `UPDATE outbox SET attempts = ...`
+needed to touch. The two connections deadlocked against each other's locks, and the test
+proving the failure path hung rather than failed. The fix is `storage/outbox.py`'s
+`record_publish_failure` running *after* the exception has propagated out of the `async with`
+block that owns the transaction — only once that rollback has actually released the locks is a
+second connection safe to write through. The lesson generalises past this one bug: a recovery
+write triggered by a failure inside a still-open transaction has to ask what locks that
+transaction is still holding, not just what data it needs to change.
+
+**The gate.** `_GatedPublisher` in `engine/drain.py` is built only by `run_drain` — the
+composition root — and only when `settings.crash_gate_armed` (the same two-fact contract as
+the other two gates: `environment == "test"` *and* `crash_gate_enabled`, never either alone).
+It performs the real `XADD` through the publisher it wraps, then records a `step_attempts` row
+under the step name `"outbox.drain"` and blocks on `crash_gates`, reusing the exact
+instrumentation `002_crash_gate.sql` and `workflows/_instrumentation.py` already built for the
+other two gates. `DrainLoop.drain_once` itself carries no branch for any of this — the
+production code path a real drain runs is identical whether or not a test is watching.
+
+`tests/test_drain_crash.py` SIGKILLs a real `python -m sankalp.engine.drain` process between
+the `XADD` and the mark, at `--count=20` (20/20): the row is confirmed still unpublished after
+the kill, a second clean drain republishes it, and the stream ends up holding two entries under
+the identical `event_id` — the at-least-once boundary, demonstrated rather than asserted.
+`tests/fleet.py::WorkerFleet.launch` gained `module=` and `ready_marker=` parameters so this
+reuses the same subprocess/readiness/kill machinery as the other two gates rather than
+duplicating it, plus a fix so that launching a second batch of processes on one fleet does not
+mistake an already-killed victim from the first batch for one that "exited before it started".
+
+### Fail-proofs, recorded
+
+| Mechanism removed | What went red | Evidence |
+|---|---|---|
+| The outbox INSERT taken out of `commit_step_output`'s transaction | `test_a_rolled_back_checkpoint_leaves_no_event` | an orphaned event survives a rollback that should have taken it with it |
+| `discard_pending_events()` removed from `_run_compensation`'s retry loop | `test_a_failed_compensation_attempt_does_not_ship_its_events_twice` | two events committed for one compensation |
+| `take_pending_events()` returning a copy instead of emptying | `test_a_retried_step_emits_one_event_not_two` | the retried step ships two events |
+| `FOR UPDATE SKIP LOCKED` removed from the claim | `test_two_concurrent_drainers_do_not_double_publish` | claimed id sets overlap |
+| The mark moved outside the claim transaction | `test_a_crash_between_the_xadd_and_the_mark_republishes`, the SIGKILL gate | both stop proving anything -- a second drainer can claim before the first's mark lands |
+
+"A gate that has never been seen to fail is not a gate."
+
+---
+
+## 7. The interview answers banked this phase
 
 1. **"Your fencing tokens worked and you still had a bug — explain."** Fencing rejects a write;
    it cannot un-execute a side effect that already ran. Four workers raced the same unwind, the
@@ -335,15 +453,20 @@ gate is a no-op that logs loudly.
 
 ---
 
-## 7. State at end of Phase 2
+## 8. State at end of Phase 2
 
-- 121 tests green, ruff clean.
-- Both crash gates at `--count=20`: forward 40/40, compensation 20/20.
+- 135 tests green, ruff clean.
+- All three crash gates at `--count=20`: forward 40/40, compensation 20/20, outbox drain 20/20.
 - Compensation executes end-to-end: reverse `seq`, exactly once per step, `COMPENSATED` or
   `FAILED_DIRTY`, every write ownership- and status-guarded.
-- The claim layer now gives forward and backward execution one ownership rule and one recovery
+- The claim layer gives forward and backward execution one ownership rule and one recovery
   path.
-- All fail-experiments reverted; `sha256sum -c` clean on both files touched by them.
-- Not built: the outbox drain loop, ledger integration in a real workflow, the 1,000-workflow
-  soak (`make test-soak` still selects nothing), resilience layer, observability. Those close
-  Phase 2 and open Phases 3–4.
+- The outbox is real, not just a table: `StepContext.emit` buffers events that commit in the
+  same transaction as a step's or compensation's checkpoint, and a drain loop (`sankalp-drain`,
+  or inline in `sankalp-worker` behind `outbox_drain_in_worker`) claims unpublished rows with
+  `FOR UPDATE SKIP LOCKED`, `XADD`s them to a Redis Stream, and marks them published --
+  at-least-once, with consumers expected to dedupe on `event_id`.
+- All fail-experiments reverted; `sha256sum -c` clean on every file touched by them.
+- Not built: ledger integration in a real workflow, the 1,000-workflow soak (`make test-soak`
+  still selects nothing), resilience layer, observability. Those close Phase 2 and open
+  Phases 3–4.

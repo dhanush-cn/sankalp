@@ -203,7 +203,7 @@ async def execute_workflow(
             elapsed = time.monotonic() - started
 
             if not await _commit_finished_step(
-                conn_pool, own, step=step, result=result, elapsed=elapsed
+                conn_pool, own, step=step, ctx=ctx, result=result, elapsed=elapsed
             ):
                 raise PreemptedError(
                     f"workflow {claimed.id} was re-claimed past fencing token "
@@ -392,7 +392,9 @@ async def _compensate(
                     exc=failure,
                 )
 
-            if not await _commit_compensation(conn_pool, own, step=step, elapsed=elapsed):
+            if not await _commit_compensation(
+                conn_pool, own, step=step, ctx=ctx, elapsed=elapsed
+            ):
                 raise PreemptedError(
                     f"workflow {claimed.id} was re-claimed past fencing token "
                     f"{claimed.fencing_token} while {step.name!r} was being compensated; its "
@@ -461,6 +463,14 @@ async def _run_compensation(
     last: Exception | None = None
 
     for attempt in range(1, attempts + 1):
+        # Every attempt starts with an empty event buffer, and this line is load-bearing rather
+        # than tidy. Unlike the forward path -- where a retry is a whole new claim with a whole
+        # new StepContext -- the unwind retries *in place* against this one context. Without the
+        # clear, an attempt that emitted and then failed would leave its events buffered, and
+        # the attempt that finally succeeds would commit them alongside its own: one undo,
+        # two events. Duplicates created here are duplicates at the source, which is the one
+        # kind consumer dedupe on event_id cannot repair.
+        ctx.discard_pending_events()
         try:
             await step.invoke_compensation(instance, ctx, forward_output)
             return None
@@ -541,6 +551,14 @@ def _context_for(
     that wrote into it would change what a *later* step reads without that ever reaching
     ``step_outputs`` -- so the workflow would behave one way on a clean run and another on
     the replay after a crash, which is the exact divergence this engine exists to rule out.
+
+    **One context per attempt.** A fresh one is built inside each loop, so the event buffer
+    behind ``ctx.emit`` starts empty every time a step or a compensation runs, and the commit
+    that consumes it empties it again (``StepContext.take_pending_events``). Both halves are
+    needed: this call site keeps a *forward* retry -- which arrives as an entirely new claim --
+    from inheriting the previous attempt's events, and the emptying keeps that true even if
+    this line is ever hoisted out of the loop. The unwind, which retries in place against one
+    context, additionally clears between attempts in :func:`_run_compensation`.
     """
     return StepContext(
         workflow_id=claimed.id,
@@ -559,6 +577,7 @@ async def _commit_finished_step(
     own: workflow_writes.Ownership,
     *,
     step: Step,
+    ctx: StepContext,
     result: StepOutput,
     elapsed: float,
 ) -> bool:
@@ -569,6 +588,10 @@ async def _commit_finished_step(
     race actually costs something: the checkpoint never appears, so the resume re-executes a
     step that already moved money. Until a step is idempotent by construction (a natural key
     plus ``ON CONFLICT DO NOTHING``) that is a real double-execution, not a theoretical one.
+
+    Anything the step emitted goes into the same transaction, so the events inherit both
+    properties this function already has: they commit with the checkpoint or not at all, and
+    the shield below keeps an orderly shutdown from abandoning them half-issued.
     """
     commit = asyncio.ensure_future(
         workflow_writes.commit_step_output(
@@ -576,10 +599,13 @@ async def _commit_finished_step(
             own,
             step_name=step.name,
             seq=step.seq,
-            # Evaluated before the future exists, so a value that cannot be encoded raises
-            # here rather than leaving a detached write to shield.
+            # Both of these are evaluated before the future exists, so a value that cannot be
+            # encoded raises here rather than leaving a detached write to shield. Taking the
+            # events also *empties* the context's buffer, which is what stops a second commit
+            # against the same context from writing them again.
             output_json=_encode_output(step, result),
             duration_seconds=elapsed,
+            events=ctx.take_pending_events(),
         )
     )
     return await _commit_shielded(commit, f"step {step.name!r}")
@@ -590,6 +616,7 @@ async def _commit_compensation(
     own: workflow_writes.Ownership,
     *,
     step: Step,
+    ctx: StepContext,
     elapsed: float,
 ) -> bool:
     """Checkpoint a compensation that has already run. The undo's half of the pair above.
@@ -598,6 +625,10 @@ async def _commit_compensation(
     happened, only the record of it is outstanding, and losing that record means the undo runs
     again on the resume. Compensations are required to be idempotent precisely because that
     window cannot be closed -- this only stops an *orderly* shutdown from walking into it.
+
+    Events the compensation emitted ride in the same transaction, exactly as on the forward
+    path. Note that the buffer reaching here holds only the *successful* attempt's events:
+    :func:`_run_compensation` clears it before each try.
     """
     commit = asyncio.ensure_future(
         workflow_writes.commit_compensation_output(
@@ -606,6 +637,7 @@ async def _commit_compensation(
             step_name=step.name,
             seq=step.seq,
             duration_seconds=elapsed,
+            events=ctx.take_pending_events(),
         )
     )
     return await _commit_shielded(commit, f"compensation for step {step.name!r}")

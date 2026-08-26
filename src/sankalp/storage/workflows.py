@@ -25,12 +25,14 @@ undo is done if and only if a second row exists with ``kind = 'COMPENSATION'``
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
 import asyncpg
 
+from sankalp.storage.outbox import PendingEvent, insert_events
 from sankalp.storage.queue import ClaimedWorkflow
 
 #: What comes back out of a JSONB column. The engine round-trips step outputs through
@@ -346,17 +348,26 @@ async def commit_step_output(
     seq: int,
     output_json: str,
     duration_seconds: float,
+    events: Sequence[PendingEvent] = (),
 ) -> bool:
-    """Checkpoint one completed step and advance the workflow's position, atomically.
+    """Checkpoint one completed step, advance the workflow, and emit its events -- atomically.
 
     The step's side effect has already happened by the time this is called; this is the
     single write that makes it *durably done*, so that a crash one instruction later replays
     the workflow without re-running the step. Returns False if the ownership guard matched
     zero rows, in which case nothing is written -- the whole thing rolls back together.
 
-    ``output_json`` is pre-serialised by the caller, on purpose: a value that cannot be
-    encoded must fail before the transaction opens, not with a half-written one held open
-    while ``json.dumps`` raises.
+    **This transaction is the answer to the dual-write problem.** The step's events go into
+    ``outbox`` right here, beside the checkpoint, so there is no instant at which one exists
+    without the other. The alternative -- commit the step, then publish -- fails in both
+    directions: crash after the commit and the event is lost; publish first and crash before
+    the commit and you have announced something that never happened. Ordering does not save
+    it, because the failure is that they are two writes. A separate drain loop moves the
+    committed rows to Redis afterwards, and *that* handoff is at-least-once (storage/outbox.py).
+
+    ``output_json`` and the events' payloads are pre-serialised by the caller, on purpose: a
+    value that cannot be encoded must fail before the transaction opens, not with a
+    half-written one held open while ``json.dumps`` raises.
     """
     async with pool.acquire() as conn, conn.transaction():
         tag = await conn.execute(
@@ -376,6 +387,11 @@ async def commit_step_output(
             output_json,
             duration_seconds,
         )
+        # Deliberately after the guarded UPDATE, which has already proved ownership and taken
+        # the row lock. A preempted worker returns above having written nothing -- and
+        # "nothing" now includes its events, which is what makes an orphaned event describing
+        # a checkpoint that was rolled back impossible rather than merely rare.
+        await insert_events(conn, own.workflow_id, events)
         return True
 
 
@@ -422,13 +438,16 @@ async def commit_compensation_output(
     step_name: str,
     seq: int,
     duration_seconds: float,
+    events: Sequence[PendingEvent] = (),
 ) -> bool:
     """Checkpoint one completed compensation, atomically with the workflow's position.
 
     Exactly :func:`commit_step_output`'s shape, and for exactly its reasons. The undo's side
     effect has already happened by the time this is called; this single write is what makes it
     *durably undone*, so a crash one instruction later resumes the unwind without running the
-    compensation again.
+    compensation again. Events a compensation emitted ride in this transaction on the same
+    terms -- an undo is a state change like any other and its event must not be able to
+    outlive a checkpoint that rolled back.
 
     The guarded UPDATE is taken first inside the transaction, before the INSERT, and that
     order is load-bearing rather than stylistic: it proves ownership *and* takes the row lock,
@@ -456,6 +475,7 @@ async def commit_compensation_output(
             seq,
             duration_seconds,
         )
+        await insert_events(conn, own.workflow_id, events)
         return True
 
 
