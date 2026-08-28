@@ -1,0 +1,188 @@
+"""FastAPI routes and Pydantic v2 request/response models.
+
+Three routes only (docs/spec.md, "Phase 1 API"): submit, read, cancel. No rate limiting, no
+middleware, no new tables -- that is a later piece.
+
+The app's pool is deliberately opened with no explicit ``dsn`` argument, so
+:func:`~sankalp.storage.pool.create_pool`'s default -- ``settings.active_app_database_url``,
+the restricted ``sankalp_app`` role (migrations/004_restricted_role.sql) -- is what actually
+runs. Passing the DSN explicitly here would silently stop testing that the default is safe.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Any
+from uuid import UUID
+
+import asyncpg
+from fastapi import FastAPI, Header, HTTPException, status
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from sankalp.engine.definition import registered_types
+from sankalp.storage import workflows as workflow_storage
+from sankalp.storage.pool import create_pool
+
+log = logging.getLogger("sankalp.api")
+
+__all__ = ["app"]
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # Importing the package is what registers the definitions -- @workflow runs at import
+    # time, and registered_types()/get_definition() can only resolve a workflow_type this
+    # process has imported (engine/worker.py's main() does the same, for the same reason).
+    # Deferred to here rather than a module-level import so api/main.py stays importable
+    # with an empty registry -- tests/test_api.py relies on that to register its own
+    # throwaway workflow type without the demo definitions bleeding in.
+    import sankalp.workflows  # noqa: F401
+
+    pool = await create_pool()
+    app.state.pool = pool
+    try:
+        yield
+    finally:
+        await pool.close()
+
+
+app = FastAPI(title="sankalp", lifespan=_lifespan)
+
+
+def _pool(app: FastAPI) -> asyncpg.Pool:
+    return app.state.pool
+
+
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+
+
+class WorkflowSubmitRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    workflow_type: str = Field(min_length=1)
+    input: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowResponse(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    id: UUID
+    workflow_type: str
+    status: str
+    input: Any
+    output: Any
+    error: str | None
+    current_step: str | None
+    attempt: int
+    completed_steps: list[str]
+
+
+def _to_response(
+    record: workflow_storage.WorkflowRecord, completed_steps: list[str]
+) -> WorkflowResponse:
+    return WorkflowResponse(
+        id=record.id,
+        workflow_type=record.workflow_type,
+        status=record.status,
+        input=record.input,
+        output=record.output,
+        error=record.error,
+        current_step=record.current_step,
+        attempt=record.attempt,
+        completed_steps=completed_steps,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+
+@app.post("/workflows")
+async def submit_workflow(
+    body: WorkflowSubmitRequest,
+    idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=1),
+) -> JSONResponse:
+    """Submit a workflow. ``Idempotency-Key`` is required.
+
+    ``INSERT ... ON CONFLICT (workflow_type, idempotency_key) DO NOTHING`` then, only on a
+    conflict, a re-select -- never ``DO UPDATE`` (docs/spec.md, "Submit handler, in full"). A
+    duplicate submit must not mutate a workflow that may already be RUNNING. See
+    :func:`sankalp.storage.workflows.submit_workflow` for why this is race-free under
+    concurrent duplicate submits with no retry loop.
+
+    201 on the request that actually created the row, 200 for a duplicate returning the
+    existing state -- decided by ``created`` below, which is why this returns a
+    :class:`~fastapi.responses.JSONResponse` directly rather than declaring a fixed
+    ``status_code`` on the route.
+    """
+    if body.workflow_type not in registered_types():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                f"workflow_type {body.workflow_type!r} is not registered; "
+                f"known types: {', '.join(registered_types()) or 'none'}"
+            ),
+        )
+
+    record, created = await workflow_storage.submit_workflow(
+        _pool(app),
+        workflow_type=body.workflow_type,
+        idempotency_key=idempotency_key,
+        input_json=json.dumps(body.input),
+    )
+    completed_steps = await workflow_storage.get_completed_steps(_pool(app), record.id)
+    payload = _to_response(record, completed_steps).model_dump(mode="json")
+    return JSONResponse(
+        status_code=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        content=payload,
+    )
+
+
+@app.get("/workflows/{workflow_id}")
+async def get_workflow(workflow_id: UUID) -> WorkflowResponse:
+    """Status, current step, completed steps, error."""
+    record = await workflow_storage.get_workflow(_pool(app), workflow_id)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="workflow not found")
+    completed_steps = await workflow_storage.get_completed_steps(_pool(app), workflow_id)
+    return _to_response(record, completed_steps)
+
+
+@app.post("/workflows/{workflow_id}/cancel")
+async def cancel_workflow(workflow_id: UUID) -> WorkflowResponse:
+    """Move a PENDING/RUNNING workflow to COMPENSATING.
+
+    Guarded in SQL by ``WHERE status IN ('PENDING', 'RUNNING')`` -- a SUCCESS, COMPENSATED,
+    already-COMPENSATING, or FAILED_DIRTY workflow cannot be touched by this route
+    (:func:`sankalp.storage.workflows.cancel_workflow`).
+
+    **This does not touch ``owner_id``/``fencing_token``: the API is not the lease holder and
+    has no fencing token to present.** A worker mid-step will not observe this cancel -- its
+    per-step writes guard on ownership, not status -- so it keeps checkpointing steps as if
+    nothing happened. It cannot reach SUCCESS afterward, though: the terminal UPDATE requires
+    ``status = 'RUNNING'``, so that write matches zero rows, the executor treats it as
+    preempted, and the row (COMPENSATING, ``owner_id`` still set until its lease expires)
+    falls back to the ordinary lease-expiry recovery path into an unwind.
+    """
+    cancelled = await workflow_storage.cancel_workflow(_pool(app), workflow_id)
+    if not cancelled:
+        record = await workflow_storage.get_workflow(_pool(app), workflow_id)
+        if record is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="workflow not found"
+            )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"workflow {workflow_id} is {record.status}; cannot be cancelled",
+        )
+    record = await workflow_storage.get_workflow(_pool(app), workflow_id)
+    assert record is not None, "cancel_workflow returned True for a row that no longer exists"
+    completed_steps = await workflow_storage.get_completed_steps(_pool(app), workflow_id)
+    return _to_response(record, completed_steps)

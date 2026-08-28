@@ -44,6 +44,7 @@ JsonValue = Any
 __all__ = [
     "CompletedStep",
     "Ownership",
+    "WorkflowRecord",
     "rows_affected",
     "load_forward_outputs",
     "load_unwind_state",
@@ -56,6 +57,10 @@ __all__ = [
     "begin_compensation",
     "defer_compensation",
     "renew_lease",
+    "submit_workflow",
+    "get_workflow",
+    "get_completed_steps",
+    "cancel_workflow",
 ]
 
 
@@ -554,4 +559,150 @@ async def renew_lease(pool: asyncpg.Pool, own: Ownership, *, duration_seconds: f
     tag = await pool.execute(
         _RENEW_LEASE_SQL, own.workflow_id, duration_seconds, own.owner_id, own.fencing_token
     )
+    return rows_affected(tag) > 0
+
+
+# ---------------------------------------------------------------------------
+# API reads/writes. Not ownership-guarded -- the API holds no lease and no
+# fencing token; these touch only the columns a submitter or a caller reading
+# workflow state is entitled to.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowRecord:
+    """A ``workflows`` row as the API reads and returns it."""
+
+    id: UUID
+    workflow_type: str
+    status: str
+    input: JsonValue
+    output: JsonValue
+    error: str | None
+    current_step: str | None
+    attempt: int
+
+
+_WORKFLOW_RECORD_COLUMNS = """
+    id, workflow_type, status, input, output, error, current_step, attempt
+"""
+
+
+def _to_record(r: asyncpg.Record) -> WorkflowRecord:
+    return WorkflowRecord(
+        id=r["id"],
+        workflow_type=r["workflow_type"],
+        status=r["status"],
+        input=_decode(r["input"]),
+        output=_decode(r["output"]),
+        error=r["error"],
+        current_step=r["current_step"],
+        attempt=r["attempt"],
+    )
+
+
+#: ``RETURNING`` on the insert first, ``DO NOTHING`` on conflict, only falling back to the
+#: SELECT below when it returns no row. This is the shape docs/spec.md's "Submit handler, in
+#: full" specifies, and the ordering is load-bearing: Postgres's speculative-insertion
+#: arbitration makes a concurrent racer's INSERT *block* on this one until it commits (or
+#: proceed itself if this one rolls back) rather than read "no conflict yet". Under the
+#: default READ COMMITTED isolation (Postgres's default, and asyncpg's ``conn.transaction()``
+#: default), the follow-up SELECT -- run only after this statement returns, in the same
+#: transaction -- takes a fresh snapshot that is guaranteed to see whichever row won. Never
+#: raise this transaction's isolation level: at REPEATABLE READ or SERIALIZABLE, the loser's
+#: blocked insert raises a serialization failure instead of resolving into DO NOTHING.
+_SUBMIT_INSERT_SQL = f"""
+INSERT INTO workflows (workflow_type, idempotency_key, input, status)
+VALUES ($1, $2, $3::jsonb, 'PENDING')
+ON CONFLICT (workflow_type, idempotency_key) DO NOTHING
+RETURNING {_WORKFLOW_RECORD_COLUMNS}
+"""
+
+_SUBMIT_SELECT_SQL = f"""
+SELECT {_WORKFLOW_RECORD_COLUMNS}
+FROM workflows
+WHERE workflow_type = $1 AND idempotency_key = $2
+"""
+
+
+async def submit_workflow(
+    pool: asyncpg.Pool, *, workflow_type: str, idempotency_key: str, input_json: str
+) -> tuple[WorkflowRecord, bool]:
+    """Insert a new workflow, or return the one a prior identical submit already created.
+
+    Returns ``(record, created)`` -- ``created`` is True only for the request that actually
+    inserted the row, which is what tells the route whether to answer 201 or 200. Never
+    ``ON CONFLICT ... DO UPDATE``: a duplicate submit must never mutate a workflow that may
+    already be RUNNING (docs/spec.md, Phase 1 API). See the SQL comments above for why the
+    two statements below are race-free under concurrent duplicate submits without a retry loop.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        row = await conn.fetchrow(_SUBMIT_INSERT_SQL, workflow_type, idempotency_key, input_json)
+        if row is not None:
+            return _to_record(row), True
+        row = await conn.fetchrow(_SUBMIT_SELECT_SQL, workflow_type, idempotency_key)
+        assert row is not None, (
+            "submit lost the race twice: INSERT found a conflict but the SELECT that follows "
+            "it, in the same transaction and after the INSERT returned, found no row"
+        )
+        return _to_record(row), False
+
+
+_GET_WORKFLOW_SQL = f"""
+SELECT {_WORKFLOW_RECORD_COLUMNS}
+FROM workflows
+WHERE id = $1
+"""
+
+
+async def get_workflow(pool: asyncpg.Pool, workflow_id: UUID) -> WorkflowRecord | None:
+    """A single workflow's current state, or None if no such id exists."""
+    row = await pool.fetchrow(_GET_WORKFLOW_SQL, workflow_id)
+    return _to_record(row) if row is not None else None
+
+
+_GET_COMPLETED_STEPS_SQL = """
+SELECT step_name
+FROM step_outputs
+WHERE workflow_id = $1 AND kind = 'FORWARD'
+ORDER BY seq
+"""
+
+
+async def get_completed_steps(pool: asyncpg.Pool, workflow_id: UUID) -> list[str]:
+    """Names of the forward steps this workflow has checkpointed, in execution order."""
+    records = await pool.fetch(_GET_COMPLETED_STEPS_SQL, workflow_id)
+    return [r["step_name"] for r in records]
+
+
+#: Only PENDING/RUNNING may be cancelled -- a SUCCESS or COMPENSATED workflow is done, and a
+#: workflow already COMPENSATING or FAILED_DIRTY is already past the point cancellation means
+#: anything. Deliberately does not touch owner_id/fencing_token: the API is not the lease
+#: holder and has no fencing token to present. A worker mid-step will not observe this
+#: transition -- its per-step writes guard on ownership, not status -- but it cannot reach
+#: SUCCESS afterward either: ``_FINISH_SUCCESS_SQL`` requires ``status = 'RUNNING'``, so that
+#: UPDATE matches zero rows, the executor treats it as preempted, and the row (COMPENSATING,
+#: owner_id still set until its lease expires) falls back to the ordinary lease-expiry
+#: recovery path into an unwind.
+_CANCEL_SQL = """
+UPDATE workflows
+SET status     = 'COMPENSATING',
+    error      = COALESCE(error, 'cancelled by user'),
+    run_after  = now(),
+    updated_at = now()
+WHERE id = $1 AND status IN ('PENDING', 'RUNNING')
+RETURNING id
+"""
+
+
+async def cancel_workflow(pool: asyncpg.Pool, workflow_id: UUID) -> bool:
+    """Move a PENDING/RUNNING workflow to COMPENSATING. False if it can't be cancelled now.
+
+    False covers two different callers' cases the route must tell apart -- the id does not
+    exist, or it exists but is already SUCCESS/COMPENSATING/COMPENSATED/FAILED_DIRTY -- by
+    design this function does not distinguish them; the route re-reads the row with
+    :func:`get_workflow` only on this path to decide 404 vs 409, so the common (successful)
+    case stays one round trip.
+    """
+    tag = await pool.execute(_CANCEL_SQL, workflow_id)
     return rows_affected(tag) > 0
