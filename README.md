@@ -212,17 +212,24 @@ edges are is the point.
 - **No benchmarks.** There are no performance numbers in this README because none have
   been measured. The design has a known throughput ceiling (WAL group-commit on a single
   queue), but a real figure requires a real load test.
-- **Ledger hardening is partial.** The append-only trigger blocks `UPDATE`/`DELETE`, but
-  `TRUNCATE` is not blocked at the trigger (the test suite depends on it). Production
-  protection is a restricted application role that is not `TRUNCATE`-granted — see roadmap.
+- **Ledger immutability is enforced at two layers.** A row-level trigger blocks
+  `UPDATE`/`DELETE` on `ledger_entries`. It cannot see `TRUNCATE` — that's not a row
+  operation, so it never fires a row trigger — so the second layer is the `sankalp_app`
+  grant set (`migrations/004_restricted_role.sql`), which has `SELECT`/`INSERT` only and
+  no `TRUNCATE` on the table. The test suite's own truncate fixture still connects as the
+  owning `sankalp` role, which is deliberately unrestricted (see
+  `tests/test_ledger.py::test_truncate_is_deliberately_not_blocked`).
+- **The `sankalp_app` password in `004_restricted_role.sql` is a dev-only literal**,
+  matching the `sankalp`/`sankalp` convention already in `docker-compose.yml`. Production
+  would inject it via environment or a secret manager, not commit it in migration SQL.
 
 ## Roadmap
 
 Phases 1 and 2 (above) are complete, tested, and the shippable core. Planned:
 
-- **Resilience (Phase 3):** Redis token-bucket rate limiting, adaptive concurrency, and a
-  restricted `sankalp_app` database role that `REVOKE`s `UPDATE`/`DELETE`/`TRUNCATE` on
-  the ledger (closing the hardening gap above).
+- **Resilience (Phase 3):** Redis token-bucket rate limiting and adaptive concurrency.
+  (The restricted `sankalp_app` database role is done — see "Ledger immutability is
+  enforced at two layers" above.)
 - **Observability (Phase 4):** OpenTelemetry tracing threaded through the outbox's
   `trace_context` column, and Prometheus metrics for queue depth, lease churn, and drain
   lag.

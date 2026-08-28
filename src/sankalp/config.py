@@ -70,6 +70,19 @@ class Settings(BaseSettings):
         default="postgresql://sankalp:sankalp@localhost:5432/sankalp_test",
         description="Pytest database. Must end in _test; the truncate fixture checks it.",
     )
+    # sankalp_app (migrations/004_restricted_role.sql) is neither a superuser nor the
+    # owner of any table -- the API and workers connect as it. Migrations and the
+    # truncate fixture keep using database_url/test_database_url above, since DDL and
+    # TRUNCATE are exactly what this role must not have (docs/spec.md, "Restricted
+    # Application Role").
+    app_database_url: PostgresDsn = Field(
+        default="postgresql://sankalp_app:sankalp_app@localhost:5432/sankalp",
+        description="Restricted role for the API and workers. Dev/prod database.",
+    )
+    test_app_database_url: PostgresDsn = Field(
+        default="postgresql://sankalp_app:sankalp_app@localhost:5432/sankalp_test",
+        description="Restricted role's DSN for the pytest database.",
+    )
     # Size the pool to Postgres cores x 2-4, NOT to HTTP concurrency. A pool of
     # ~16 serves thousands of concurrent async requests; oversized pools make
     # Postgres slower, not faster (docs/spec.md, Operational Notes).
@@ -189,6 +202,17 @@ class Settings(BaseSettings):
             )
         if _database_name(str(self.database_url)) == _database_name(str(self.test_database_url)):
             raise ValueError("database_url and test_database_url must name different databases")
+        if _database_name(str(self.app_database_url)) != _database_name(str(self.database_url)):
+            raise ValueError(
+                "app_database_url must name the same database as database_url -- "
+                "sankalp_app is a restricted role on the same database, not a different one"
+            )
+        if _database_name(str(self.test_app_database_url)) != _database_name(
+            str(self.test_database_url)
+        ):
+            raise ValueError(
+                "test_app_database_url must name the same database as test_database_url"
+            )
         return self
 
     # ---- Derived ------------------------------------------------------------
@@ -203,6 +227,13 @@ class Settings(BaseSettings):
         """Same server, ``postgres`` database -- for CREATE DATABASE, which cannot
         run inside a transaction or against the database being created."""
         return _with_database(str(self.database_url), "postgres")
+
+    @property
+    def active_app_database_url(self) -> str:
+        """The restricted-role DSN this process's worker/drain pool should use."""
+        if self.environment == "test":
+            return str(self.test_app_database_url)
+        return str(self.app_database_url)
 
     @property
     def database_name(self) -> str:

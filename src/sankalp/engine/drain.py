@@ -210,7 +210,8 @@ async def run_drain(settings: Settings | None = None) -> None:
     from sankalp.storage.redis import create_redis
 
     settings = settings or get_settings()
-    pool = await create_pool(settings=settings)
+    # sankalp_app, not the owning role -- see worker.py's run_worker() for why.
+    pool = await create_pool(settings.active_app_database_url, settings=settings)
     redis = create_redis(settings=settings)
     try:
         publisher: Publisher = RedisStreamPublisher(

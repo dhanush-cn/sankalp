@@ -21,6 +21,8 @@ import uuid
 import asyncpg
 import pytest
 
+from sankalp.config import get_settings
+
 #: docs/spec.md, "Reconciliation" -- verbatim. Every transfer must net to zero, so this
 #: returns the transfers that do not. It must return no rows, always.
 RECONCILE = """
@@ -370,10 +372,12 @@ async def test_truncate_is_deliberately_not_blocked(conn, insert_workflow):
     this test fails with a message naming the reason, instead of every other test in the
     suite failing inside the fixture for no visible cause.
 
-    The honest state of this gap, per 003_saga.sql: there is no restricted application
-    role yet -- everything connects as the `sankalp` superuser, which also owns the table
-    -- so nothing currently stops a TRUNCATE. The control is a Phase 3 `sankalp_app` role
-    with TRUNCATE, DELETE and UPDATE revoked, and it does not exist yet.
+    This connection (``conn``, the owning `sankalp` role) is deliberately not restricted
+    -- it is what this fixture and the truncate fixture both need TRUNCATE to keep
+    working with. The actual control is the `sankalp_app` role
+    (migrations/004_restricted_role.sql), which has no TRUNCATE/UPDATE/DELETE on this
+    table at all; see test_sankalp_app_cannot_update_delete_or_truncate_ledger_entries
+    below.
     """
     workflow_id = await insert_workflow()
     await _post(conn, workflow_id)
@@ -381,3 +385,48 @@ async def test_truncate_is_deliberately_not_blocked(conn, insert_workflow):
     await conn.execute("TRUNCATE ledger_entries")
 
     assert await conn.fetchval("SELECT count(*) FROM ledger_entries") == 0
+
+
+async def test_sankalp_app_cannot_update_delete_or_truncate_ledger_entries(
+    conn, insert_workflow
+):
+    """What this proves: `sankalp_app` (migrations/004_restricted_role.sql) has SELECT and
+    INSERT on `ledger_entries` and nothing else -- UPDATE, DELETE, and TRUNCATE against it
+    all fail at the privilege check.
+
+    This is the gap the append-only trigger structurally cannot cover on its own: TRUNCATE
+    is not a row operation, so it never fires a row trigger, and the trigger here is
+    BEFORE UPDATE OR DELETE (see test_the_guard_has_no_conditional_bypass). The trigger
+    stops UPDATE/DELETE; the grant set is what stops TRUNCATE. Proved from a connection
+    that is genuinely `sankalp_app` -- not the owning `sankalp` connection every other test
+    in this file uses, which the trigger alone would still let TRUNCATE past.
+
+    `sankalp_app` is neither a superuser nor the owner of `ledger_entries` (both
+    conditions are load-bearing -- see the migration): a REVOKE against either would be
+    theatre, not a control.
+    """
+    workflow_id = await insert_workflow()
+    await _post(conn, workflow_id, step_name="debit_source", account_id="acct:A")
+
+    app_conn = await asyncpg.connect(str(get_settings().test_app_database_url))
+    try:
+        # What the role is granted: append, and read what has been appended.
+        assert await app_conn.fetchval("SELECT count(*) FROM ledger_entries") == 1
+        await _post(app_conn, workflow_id, step_name="credit_dest", account_id="acct:B")
+        assert await app_conn.fetchval("SELECT count(*) FROM ledger_entries") == 2
+
+        # What it is not: UPDATE, DELETE, TRUNCATE all fail at the privilege check, not
+        # at the append-only trigger -- the trigger would raise RestrictViolationError,
+        # this raises InsufficientPrivilegeError instead, and the role must never even
+        # reach the trigger to find out it would have blocked the statement anyway.
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await app_conn.execute("UPDATE ledger_entries SET amount_minor = 1")
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await app_conn.execute("DELETE FROM ledger_entries")
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await app_conn.execute("TRUNCATE ledger_entries")
+
+        # Confirm nothing above did anything despite raising.
+        assert await app_conn.fetchval("SELECT count(*) FROM ledger_entries") == 2
+    finally:
+        await app_conn.close()

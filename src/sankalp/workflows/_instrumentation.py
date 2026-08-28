@@ -52,8 +52,10 @@ _GATE_POLL_SECONDS = 0.02
 
 # A pool of these modules' own, because the engine hands a step a StepContext and not a
 # connection -- by design (engine/definition.py: the definition "holds no connection, opens no
-# transaction"). It points at settings.active_database_url, so a worker launched with
-# SANKALP_ENVIRONMENT=test records into sankalp_test like everything else in the run.
+# transaction"). Deliberately opened on the owning role (settings.active_database_url), not
+# sankalp_app: side_effects/step_attempts/crash_gates (migrations/002_crash_gate.sql) get zero
+# grants from 004_restricted_role.sql. A worker launched with SANKALP_ENVIRONMENT=test still
+# records into sankalp_test, same as before.
 _pool: asyncpg.Pool | None = None
 _pool_lock = asyncio.Lock()
 
@@ -78,7 +80,8 @@ async def get_pool() -> asyncpg.Pool:
         return _pool
     async with _pool_lock:
         if _pool is None:
-            _pool = await create_pool()
+            settings = get_settings()
+            _pool = await create_pool(settings.active_database_url, settings=settings)
     return _pool
 
 

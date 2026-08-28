@@ -392,7 +392,11 @@ async def run_worker(settings: Settings | None = None) -> None:
     from sankalp.storage.pool import create_pool
 
     settings = settings or get_settings()
-    pool = await create_pool(settings=settings)
+    # sankalp_app, not the owning role: this is the pool that claims and executes real
+    # work (migrations/004_restricted_role.sql, docs/spec.md "Restricted Application
+    # Role"). The crash-gate instrumentation pool (workflows/_instrumentation.py) is
+    # separate and deliberately stays on the owning role.
+    pool = await create_pool(settings.active_app_database_url, settings=settings)
     drain_task: asyncio.Task[None] | None = None
     redis = None
     if settings.outbox_drain_in_worker:

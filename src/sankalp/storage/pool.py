@@ -30,10 +30,12 @@ async def create_pool(
     min_size: int | None = None,
     max_size: int | None = None,
 ) -> asyncpg.Pool:
-    """Open a pool against ``dsn``, defaulting to the database this environment selects."""
+    """Open a pool against ``dsn``, defaulting to ``sankalp_app`` (the restricted role) on
+    the database this environment selects. Pass ``settings.active_database_url`` explicitly
+    for the owning role -- DDL, TRUNCATE, or tables 004 grants nothing on."""
     settings = settings or get_settings()
     return await asyncpg.create_pool(
-        dsn or settings.active_database_url,
+        dsn or settings.active_app_database_url,
         min_size=min_size if min_size is not None else settings.db_pool_min_size,
         max_size=max_size if max_size is not None else settings.db_pool_max_size,
         command_timeout=settings.db_command_timeout_seconds,
