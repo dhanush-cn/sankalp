@@ -33,6 +33,9 @@ plumbing that no one would claim credit for (config loading, linting) is not tha
 fastapi, uvicorn, asyncpg, pydantic, pydantic-settings, redis, opentelemetry-*, pytest,
 pytest-asyncio, pytest-repeat, ruff.
 
+**Show diffs before applying, when asked.** If asked to show a diff, draft, or plan before
+applying it — show it and wait for approval. Do not write the file or apply the edit first.
+
 **Every feature ships with a test that proves it.** pytest + pytest-asyncio against a real
 Postgres — never mocked, never a container per session: isolation comes from the truncate
 fixture, because the crash test runs 20x and the soak runs 1000 workflows. One container on
@@ -59,6 +62,20 @@ docker-compose.yml  repo root — Postgres (5432, both DBs), Redis
 
 - **Migrations** are `NNN_description.sql`, forward-only, never edited once committed. Schema
   changes are new files, applied to both databases. SQL lives in `storage/`, not ORM models.
+  Commit a migration alone, before the code that depends on it — not for the checksum (that
+  replays per-file regardless of commit grouping), but for revertability: you can roll back
+  dependent code without unwinding the schema, or roll back the schema without touching code
+  that hasn't shipped yet.
+- **`create_pool()` defaults to the restricted role** (`sankalp_app` / `active_app_database_url`).
+  The owning role (`active_database_url`) is an explicit opt-out, only where DDL, TRUNCATE, or
+  the crash-gate instrumentation tables require it (migrations, the test truncate fixture,
+  `_instrumentation.py`). Forgetting the override fails closed — a missing grant errors, it does
+  not silently fall back to owner privileges.
+- **`side_effects`, `step_attempts`, `crash_gates` have no `sankalp_app` grants, by design.**
+  Anything writing to them must use the owning role — this is not a gap to close.
+- **A migration that creates `resources` or `workers` must grant `sankalp_app`
+  `SELECT`/`INSERT`/`UPDATE`** on it (`resources` for the fenced balance write, `workers` for
+  heartbeats), or the worker hits a silent permission-denied under the restricted role.
 - **Statuses** are exactly six: `PENDING RUNNING SUCCESS COMPENSATING COMPENSATED
   FAILED_DIRTY`. `FAILED_DIRTY` means compensation failed — alert a human. Don't add a seventh.
 - **Claiming work** uses the dequeue query in `docs/spec.md` (`FOR UPDATE SKIP LOCKED`, lease
@@ -67,6 +84,10 @@ docker-compose.yml  repo root — Postgres (5432, both DBs), Redis
   AND owner_id = $2 AND fencing_token = $3`). Zero rows means preempted: abort, drop the work.
 - **Backoff** is exponential with jitter: `min(2 ** attempt, 60) * (0.5 + random())`. Never
   remove the jitter — it stops a thundering herd when a downstream recovers.
+- **Clocks are deliberately split.** The rate limiter uses the caller's wall clock (`now_ms`),
+  not Redis `TIME`, for testability; the adaptive concurrency limiter and circuit breaker use
+  injected monotonic clocks (`Callable[[], float] = time.monotonic`). Don't unify these onto one
+  clock — the split is deliberate, not an inconsistency.
 - **Money is integer minor units** — `BIGINT` (`ledger_entries.amount_minor`), `int` in Python.
   Paise, not rupees. Never float, never `Decimal`. Display strings only at the API boundary.
 - **Errors** distinguish `RetryableError` from terminal failures. Retryable goes back to the
