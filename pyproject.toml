@@ -51,7 +51,7 @@ asyncio_mode = "auto"
 # Function-scoped event loop: the crash tests run 20x and must not share loop
 # state between repetitions.
 asyncio_default_fixture_loop_scope = "function"
-addopts = "-ra --strict-markers"
+addopts = "-ra --strict-markers -m 'not slow'"
 markers = [
     "slow: soak and chaos tests (1000 workflows, worker kills)",
 ]

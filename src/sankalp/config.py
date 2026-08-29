@@ -144,6 +144,50 @@ class Settings(BaseSettings):
         description="The cap in min(2 ** attempt, cap) * (0.5 + random()). Jitter is not optional.",
     )
 
+    # ---- Rate limiting --------------------------------------------------------
+    # docs/spec.md, "Token Bucket (Redis Lua)": one bucket per route class (submit/read/cancel),
+    # never per caller -- see resilience/ratelimit.py's module docstring for why per-idempotency
+    # -key and per-IP were both rejected. State lives only in Redis; losing it on restart just
+    # means every bucket starts full, which is harmless because the limiter already fails open.
+    ratelimit_enabled: bool = Field(
+        default=True,
+        description="False disables the middleware entirely -- every request is admitted, "
+        "same fail-open stance as a dead Redis, but deliberate rather than incidental.",
+    )
+    ratelimit_capacity: int = Field(default=100, ge=1, description="Bucket size, in tokens.")
+    ratelimit_refill_per_second: float = Field(
+        default=50.0,
+        gt=0,
+        description="Tokens/sec. The Lua script also guards this at gt=0 independently -- "
+        "belt and suspenders, since a caller bug there must surface as a logged ResponseError, "
+        "not a division by zero inside PEXPIRE.",
+    )
+    # Reads and cancels are cheap; submits create rows and drive workflow execution. Pricing
+    # submits above 1 is what stops a flood of cheap reads from starving the budget submits
+    # need, given all three share one capacity/refill pair -- see ratelimit.py's key-scheme
+    # docs for why this is NOT cross-workflow-type prioritisation, only cross-route-class.
+    ratelimit_submit_cost: int = Field(default=5, ge=1)
+    ratelimit_read_cost: int = Field(default=1, ge=1)
+    ratelimit_cancel_cost: int = Field(default=1, ge=1)
+    ratelimit_key_prefix: str = Field(default="sankalp.ratelimit", min_length=1)
+    # A local Redis round trip is sub-millisecond; 50ms is ~50x headroom. Reusing
+    # outbox_redis_timeout_seconds (5.0, sized for a background batch that can afford to wait)
+    # would mean a hung Redis adds up to 5s to *every* request until the breaker opens -- with
+    # the default failure_threshold below that is up to 25s of stalled requests per process
+    # before protection engages, instead of ~250ms.
+    ratelimit_redis_timeout_seconds: float = Field(default=0.05, gt=0)
+    ratelimit_breaker_failure_threshold: int = Field(
+        default=5,
+        ge=1,
+        description="Consecutive Redis transport failures before the breaker opens.",
+    )
+    ratelimit_breaker_cooldown_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        description="Base cooldown before a half-open probe; grows with jitter on repeated "
+        "failed probes (resilience/circuit.py).",
+    )
+
     # ---- Outbox -------------------------------------------------------------
     outbox_batch_size: int = Field(default=100, ge=1)
     outbox_poll_interval_seconds: float = Field(default=0.2, gt=0)

@@ -1,7 +1,9 @@
 """FastAPI routes and Pydantic v2 request/response models.
 
-Three routes only (docs/spec.md, "Phase 1 API"): submit, read, cancel. No rate limiting, no
-middleware, no new tables -- that is a later piece.
+Three routes (docs/spec.md, "Phase 1 API"): submit, read, cancel. No new tables. Fronted by
+:class:`~sankalp.api.middleware.RateLimitMiddleware` -- a Redis token bucket per route class,
+behind a circuit breaker that fails open (``resilience/ratelimit.py``, ``resilience/circuit.py``)
+-- which is the piece that used to be described here as "not built."
 
 The app's pool is deliberately opened with no explicit ``dsn`` argument, so
 :func:`~sankalp.storage.pool.create_pool`'s default -- ``settings.active_app_database_url``,
@@ -23,9 +25,14 @@ from fastapi import FastAPI, Header, HTTPException, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from sankalp.api.middleware import RateLimitMiddleware
+from sankalp.config import get_settings
 from sankalp.engine.definition import registered_types
+from sankalp.resilience.circuit import CircuitBreaker
+from sankalp.resilience.ratelimit import TokenBucketLimiter
 from sankalp.storage import workflows as workflow_storage
 from sankalp.storage.pool import create_pool
+from sankalp.storage.redis import create_redis
 
 log = logging.getLogger("sankalp.api")
 
@@ -42,15 +49,51 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # throwaway workflow type without the demo definitions bleeding in.
     import sankalp.workflows  # noqa: F401
 
+    settings = get_settings()
     pool = await create_pool()
     app.state.pool = pool
+
+    redis = None
+    if settings.ratelimit_enabled:
+        redis = create_redis(
+            settings=settings, socket_timeout_seconds=settings.ratelimit_redis_timeout_seconds
+        )
+        limiter = TokenBucketLimiter(
+            redis,
+            key_prefix=settings.ratelimit_key_prefix,
+            capacity=settings.ratelimit_capacity,
+            refill_per_second=settings.ratelimit_refill_per_second,
+            budget_seconds=settings.ratelimit_redis_timeout_seconds,
+            breaker=CircuitBreaker(
+                failure_threshold=settings.ratelimit_breaker_failure_threshold,
+                cooldown_seconds=settings.ratelimit_breaker_cooldown_seconds,
+            ),
+        )
+        await limiter.load_script()
+        app.state.limiter = limiter
+        log.info(
+            "rate limiting enabled: capacity=%d refill=%.1f/s breaker_threshold=%d",
+            settings.ratelimit_capacity,
+            settings.ratelimit_refill_per_second,
+            settings.ratelimit_breaker_failure_threshold,
+        )
+    else:
+        # Explicit opt-out, logged the same as the enabled path -- a wiring gap should never
+        # look identical to a deliberate choice in the logs. RateLimitMiddleware admits every
+        # request when app.state.limiter is unset, which is what running with this False does.
+        app.state.limiter = None
+        log.warning("rate limiting disabled (SANKALP_RATELIMIT_ENABLED=false)")
+
     try:
         yield
     finally:
+        if redis is not None:
+            await redis.aclose()
         await pool.close()
 
 
 app = FastAPI(title="sankalp", lifespan=_lifespan)
+app.add_middleware(RateLimitMiddleware)
 
 
 def _pool(app: FastAPI) -> asyncpg.Pool:

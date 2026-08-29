@@ -75,13 +75,38 @@ async def client(app_pool: asyncpg.Pool) -> AsyncIterator[httpx.AsyncClient]:
     ``app.state.pool`` directly is what lets this fixture hand the app a pool pinned to
     ``sankalp_test`` regardless of ambient environment, which the lifespan's own
     ``create_pool()`` call (reading ambient settings) cannot guarantee.
+
+    Same reasoning extends to ``app.state.limiter``: bypassing the lifespan means it is never
+    otherwise set, and ``RateLimitMiddleware`` fails open on a missing limiter -- so every test
+    in this file would silently skip the middleware's enforcement path rather than exercise it.
+    Built against the real Redis, a per-test key prefix (the ``event_stream`` fixture's
+    isolation pattern in conftest.py, applied here), and a capacity generous enough that no
+    test in this file -- including the 10-way concurrent submit below -- trips it by accident;
+    ``tests/test_ratelimit.py`` is where the limiter's own enforcement is actually proved.
     """
     from sankalp.api.main import app
+    from sankalp.resilience.circuit import CircuitBreaker
+    from sankalp.resilience.ratelimit import TokenBucketLimiter
+    from sankalp.storage.redis import create_redis
 
     app.state.pool = app_pool
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-        yield ac
+    redis = create_redis(socket_timeout_seconds=1.0)
+    limiter = TokenBucketLimiter(
+        redis,
+        key_prefix=f"sankalp.ratelimit.test.{uuid.uuid4().hex}",
+        capacity=10_000,
+        refill_per_second=10_000.0,
+        budget_seconds=1.0,
+        breaker=CircuitBreaker(),
+    )
+    await limiter.load_script()
+    app.state.limiter = limiter
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            yield ac
+    finally:
+        await redis.aclose()
 
 
 async def _row(
