@@ -306,3 +306,203 @@ here.
   full non-crash suite (148 tests) green; ruff clean.
 - Not built: rate limiting, adaptive concurrency, observability (Phase 3's remaining pieces and
   Phase 4).
+
+---
+
+## 4. The rate limiter — fail-open, the breaker that makes it fast, and the clock
+
+`2870880` — a Redis-backed token bucket (`resilience/ratelimit.py`) fronted by a circuit
+breaker (`resilience/circuit.py`), enforced as ASGI middleware (`api/middleware.py`) in front
+of all three routes from Section 3. One tier only: every check is a Redis round trip; there is
+no in-process L1 cache underneath it, and that absence matters below.
+
+### Fail-open is the correct stance here, not a weakened one
+
+When the breaker is open, or Redis answers with a transport failure, `check()` returns
+`admitted=True, enforced=False` — every request goes through, unconditionally. Not a smaller
+limit, not a cached last-known-good decision: no admission control at all, because there is no
+L1 tier to fall back to.
+
+That's deliberate, and the reasoning is the same one that lets Section 3's cancel route leave a
+worker temporarily unaware it's been cancelled: the limiter is a protective control, not a
+correctness control. Nothing about the money guarantee depends on it. `POST /workflows` is
+idempotent under concurrent duplicates by construction (Section 3); every step commits its
+effect exactly once regardless of how many times it's attempted (the project's core guarantee,
+stated in `CLAUDE.md`). A flood during a Redis outage costs throughput — it cannot make a step
+execute twice. Failing closed would take an outage of one dependency this system has never
+promised durability from, and turn it into a total outage of money movement over a dependency
+whose entire job is shedding load, not holding state. That's a strictly worse failure mode than
+the one being defended against.
+
+The scope caveat is worth stating plainly rather than leaving implicit: this reasoning holds
+only because the limiter enforces an aggregate protective budget, not an entitlement. If a
+route class's limit ever becomes a per-tenant contractual quota — "this customer is guaranteed
+no more than N/sec, full stop" — fail-open becomes wrong, because now unlimited admission
+during an outage isn't a throughput cost, it's the SLA itself being silently violated. That's a
+different feature with a different failure mode, and it isn't what's built here.
+
+Fail-open alone is not sufficient, and the breaker is why: without it, every request during an
+outage still pays a full connect/read timeout against a socket that will never answer. That
+doesn't just remove rate limiting — under a constant arrival rate it makes the API slow enough
+that the request queue grows without bound, which is its own outage. The breaker is what turns
+"fail open" into "fail open *fast*": once it trips, `allow()` returns `False` synchronously,
+before any socket is touched, and the answer comes back in microseconds instead of at the
+timeout budget. Fail-open decides what the answer is when Redis is unreachable; the breaker
+decides how fast that answer arrives — they're solving two different halves of the same outage.
+
+### The breaker counts transport failures, never application answers
+
+`_run`'s exception handling is the one thing in this module most worth reading closely before
+changing it, because the three outcomes it distinguishes look similar from the outside and
+must not be merged:
+
+- `ResponseError` (which includes `NoScriptError`) — Redis answered, promptly and correctly, and
+  the answer happened to be an error. Never fed to the breaker.
+- `TimeoutError | RedisError | OSError` — Redis (or the socket to it) did not answer. Fed to
+  the breaker.
+
+A `NOSCRIPT` means the script cache is cold — a restart, a `SCRIPT FLUSH`, a failover onto a
+replica that never got `SCRIPT LOAD`'d. Redis is not merely up, it's telling the caller exactly
+what to do next (`EVAL` once, and the cache repopulates as a side effect of that call). Counting
+it as a breaker failure would trip the breaker at the exact moment Redis is healthiest —
+answering fast and correctly — and a real Redis restart makes this failure mode certain rather
+than rare: every API process's local script cache goes cold at once, so without the special
+case, a routine restart would produce a burst of `NOSCRIPT`s across the whole fleet
+simultaneously, tripping every breaker on a Redis that has just come back. `_eval_with_retry`
+catches `NoScriptError` and retries once with a full `EVAL`, entirely inside `_run`, before the
+transport-failure classification ever runs — the breaker never even learns a `NOSCRIPT`
+happened.
+
+A script bug — today, only `refill_per_sec <= 0`, rejected via `redis.error_reply` — is also a
+`ResponseError`, and deliberately handled the same way: fail open, but log at `ERROR` and leave
+the breaker `CLOSED`. This is a permanent programming error (a caller passed a bad config), not
+a transient outage, and disguising it as one would be actively misleading — it would make the
+breaker open and later self-heal on its own cooldown, which reads as "Redis recovered" when
+what actually happened is "someone shipped a bad value and never got paged for it." Loud and
+un-self-healing is the right shape for a bug; quiet and self-healing is the right shape for an
+outage. Conflating them loses the ability to tell which one is happening from the outside.
+
+### The clock: whose, and why the choice looks locally wrong and is globally right
+
+`check()` computes `now_ms = int(self._clock() * 1000)` in the caller's process and passes it
+into the Lua script as `ARGV[3]`, rather than letting the script call Redis's own `TIME`.
+
+**The failure mode this creates, and the one line that bounds it.** Every bucket's state is
+keyed off whatever `now_ms` the *last* caller happened to pass. If a caller's clock is skewed —
+behind the value already stored for that key, whether from NTP drift, a VM pause, or simple
+cross-instance disagreement — naive arithmetic computes a negative `elapsed`, and a negative
+elapsed multiplied by `refill` *subtracts* tokens instead of adding them. Enough skew, or enough
+callers hitting the same key with different clocks, drives `tokens` arbitrarily negative — and
+because nothing subsequently pulls it back up except real elapsed time at the configured refill
+rate, the bucket can end up needing a very long time to refill back past zero. Run the numbers
+on the exact skew `test_a_caller_whose_clock_lags_never_drains_the_bucket_below_zero` exercises
+— `capacity=10`, `refill_per_second=5.0`, a 50,000-second backward clock jump — through the
+pre-clamp arithmetic:
+
+```
+Call 1 (clock=100_000.0s -> now_ms=100_000_000): first write to this key, so tokens=capacity=10.
+  cost=1 -> tokens=9, allowed. Stored: tokens=9, ts=100_000_000.
+
+Call 2 (clock=50_000.0s -> now_ms=50_000_000), no clamp:
+  elapsed = (50_000_000 - 100_000_000) / 1000 = -50_000 s
+  tokens  = min(10, 9 + (-50_000 * 5)) = min(10, -249_991) = -249_991
+  denied (-249_991 < cost). Stored: tokens=-249_991.
+
+Recovery, assuming no further skew:
+  tokens needed to reach cost=1: 249_991 + 1 = 249_992
+  at refill=5 tokens/sec: 249_992 / 5 = 49_998.4 s ~= 13h 53m
+```
+
+One skewed call drives `tokens` to −249,991, and recovering to the single token a request needs
+costs 49,998 seconds — **just under 14 hours** — of real time at the configured refill rate.
+That's not a slower bucket — it's every request against that key denied for a duration with no
+relationship to how large the clock skew actually was.
+
+`math.max(0, now_ms - last_ts)` (`ratelimit.py`'s Lua, the line called out in its own comment)
+is the fix, and the shape of what it changes is the whole point: it doesn't remove skew, it
+bounds its consequence. A lagging clock now contributes exactly zero refill instead of negative
+refill — no worse than a caller who happened not to call in for a while. A fast clock can still
+over-refill, but only up to `capacity`, via the `math.min` two lines down — a one-time bounded
+burst, never an unbounded one. Skew degrades to "one bucket briefly acts as if slightly more or
+less time passed than it did," never to "this bucket is now permanently wrong" or "this bucket
+is now deadlocked." That's the entire difference between a clamp being defensive padding and
+being load-bearing: remove it, and the failure mode isn't a slightly worse limiter, it's an
+outage shaped like a rate limiter.
+
+**Why the caller's clock instead of Redis's `TIME`, honestly.** `TIME` would actually be *more*
+correct for this specific bucket: one authoritative clock, called from inside the script, means
+no cross-instance skew to bound in the first place — the failure mode above wouldn't exist. And
+the classical objection to `TIME` — that it isn't deterministic and so breaks replication —
+doesn't apply here: Redis has replicated by *effect* (propagating the writes a script produced)
+rather than by verbatim command since Redis 5, and this is Redis 7. So the honest reason to keep
+the caller's clock isn't correctness; it's testability. It's the injection seam that lets
+`test_atomicity_under_200_concurrent_callers_admits_exactly_the_capacity` pin every caller to
+the same instant and assert exactly 50-of-200 admitted as an equality, not a tolerance band
+around real wall-clock jitter — the same trade `compute_backoff` already made in taking an
+injectable `rng` instead of reaching for the module's own random state. On genuinely
+unsynchronized hosts, this is a one-line change: swap the `ARGV[3]` clock for `redis.call('TIME')`
+inside the script and drop the parameter. Nothing else about the bucket's shape changes.
+
+### Three bugs found in `docs/spec.md`'s reference script, fixed here
+
+Implementing the spec's Lua surfaced three places where the reference script is wrong, not just
+stylistically dated:
+
+1. **Truncated tokens, but a correct `retry_after_ms`.** Redis truncates a Lua number to an
+   integer on the RESP reply, so the spec's `return { allowed, tokens }` silently hands the
+   caller `9` for a true count of `9.5` — a fractional token, lost with no signal it happened.
+   Truncation itself is fine for the token count; the bug would be computing `retry_after_ms`
+   *from* the already-truncated value. This script computes it in Lua, before the return, while
+   `tokens` and the deficit are still floats — the client's `Retry-After` header reflects the
+   real deficit, not one rounded down first.
+2. **`HSET`, not `HMSET`.** The spec's script uses `HMSET`, deprecated by Redis since 4.0.
+3. **`refill <= 0` rejected explicitly**, via `redis.error_reply`, before it reaches the
+   `PEXPIRE` line's division. The spec's version divides by it unguarded — a caller bug turns
+   into a Lua runtime error at a different line than the one that caused it, with no message
+   pointing at the actual mistake. Guarding it explicitly turns "someone passed a bad config"
+   into a clean `ResponseError` that — per the breaker rules above — fails open and logs loudly
+   without touching the breaker. (`Settings` also constrains `refill_per_second > 0`
+   independently; this is the second, inner check, for anything that reaches the script by a
+   path the outer one didn't cover.)
+
+### What proves it
+
+Five fail-proofs, each one built by breaking the mechanism first and watching the test catch it:
+
+- Feed the script the clock-lag test's own values (`capacity=10`, `refill=5.0/s`, a
+  50,000-second backward jump) without the clamp: the arithmetic above drives the bucket to
+  −249,991 tokens and a ~13.9-hour (49,998-second) recovery from a single skewed call — not a
+  degraded limiter, an outage. With `math.max(0, ...)` in place, the same skew costs one
+  bucket's worth of under-refill and nothing more.
+- Route a `NOSCRIPT` through the plain transport-failure path instead of the dedicated retry:
+  the breaker trips on a Redis that just answered correctly.
+- Remove the breaker's short-circuit and blackhole Redis: 20 sockets get opened against a
+  hung Redis that should never have been touched once the breaker was open — `test_
+  breaker_opens_after_the_threshold_and_stops_touching_the_socket` asserts `connections == 0`
+  for exactly this reason.
+- Race 50 concurrent callers through `HALF_OPEN` without the single-synchronous-call state
+  flip: more than one probe reaches Redis. With `allow()`'s state transition and its "yes"
+  happening inside the same non-`await`ing call, exactly one of the 50 gets `enforced=True`
+  and `connections` advances by at most one.
+- `test_atomicity_under_200_concurrent_callers_admits_exactly_the_capacity` at `--count=20`:
+  260/260 clean runs of an exact-equality assertion (50-of-200 admitted, pinned clock, no
+  tolerance band) — the kind of assertion that only stays green by accident if the underlying
+  atomicity is real.
+
+Crash gates unaffected — this piece touches no worker, dequeue, or checkpoint path, so
+`tests/test_crash.py` and friends weren't expected to move and didn't.
+
+275 lines in `resilience/ratelimit.py`, roughly 650 across `test_ratelimit.py` and
+`test_circuit.py` combined. That ratio is not padding — it's what "the proof is the point"
+looks like in line counts on a module whose entire job is behaving correctly under exactly the
+concurrent and adversarial conditions that are hardest to exercise by hand.
+
+### What's not built yet
+
+No adaptive concurrency (a gradient limiter that scales worker concurrency to observed
+latency, not anything about Redis) — the breaker here only ever answers admit-or-don't. No
+load testing: everything above is a unit-level proof of the mechanism (atomicity, fail-open,
+breaker timing, clock-skew bounding) under controlled, synthetic conditions — a real
+production overload, with real network variance and real client behavior, hasn't been measured
+against this. The fail-proofs show the mechanism does what it claims when deliberately broken;
+they are not evidence of how it behaves under organic load.
