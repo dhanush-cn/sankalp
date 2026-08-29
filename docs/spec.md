@@ -545,6 +545,10 @@ Each reader independently rolls dice, weighted so the probability of early refre
 ## Phase 3 Gate
 
 1. **Overload:** ramp to 5× measured capacity. P99 stays within target; excess returns 429/503. Show the Grafana panel where concurrency limit drops as latency climbs.
+
+   This gate is planned to be discharged by a load harness in `loadtest/` (not yet built), run
+   against the `sankalp_app` restricted role. "P99 stays within target" is planned to be proven
+   there, not yet demonstrated.
 2. **Zombie writer:** claim a workflow (token 7), `SIGSTOP` the worker, let the lease expire, let another worker claim (token 8) and commit, then `SIGCONT` the first. Assert its write is rejected and the balance is correct.
 3. **Redis down:** kill Redis, confirm the API stays up (fails open) and workflows still complete.
 
@@ -675,7 +679,21 @@ After every run: reconciliation query returns 0 rows, no workflow stuck non-term
 
 ## Phase 4 Gate
 
-A README containing: architecture diagram, a Grafana screenshot spanning an injected-chaos window, a trace screenshot showing a crash-and-resume with linked spans, and a results table of reproducible numbers with the hardware stated.
+**Phase 4 Gate (rescoped).** A README section containing: (a) a reproducible results table
+from `loadtest/` with hardware stated, (b) the concurrency-limit-vs-RTT relationship as
+committed time-series data (CSV + plot) showing the limit drops as latency climbs, (c) the
+admitted-P99-bounded and LOW-sheds-before-HIGH claims proven under overload, (d) an honest
+methodology section stating the same-machine load-generation caveat, and (e) a chaos suite
+(Toxiproxy in front of Postgres and Redis) proving that under injected faults — DB latency,
+connection cuts, Redis down, worker kills — the reconciliation query still nets to zero, no
+workflow is stuck non-terminal, the outbox drains, and no side effect duplicates.
+
+Deferred, with rationale: distributed tracing (Jaeger/linked spans) and Grafana dashboards are
+deferred. They render evidence the system already produces in logs and metrics; they do not
+change any correctness or resilience claim. The load harness converts the design's performance
+claims from asserted to measured, and the chaos suite proves the resilience mechanisms hold
+under fault — both are proof. Tracing and dashboards are presentation and can be added later
+without changing what the system guarantees.
 
 ---
 
