@@ -188,6 +188,36 @@ class Settings(BaseSettings):
         "failed probes (resilience/circuit.py).",
     )
 
+    # ---- Adaptive concurrency -------------------------------------------------
+    # docs/spec.md, "Adaptive Concurrency": in-process, no Redis -- unlike the rate limiter this
+    # protects one API process's own slice of db_pool_max_size, so each process running its own
+    # instance is correct, not a gap. Numeric defaults below are starting points, not measured
+    # (no load-testing harness exists yet, same position ratelimit_capacity/refill started from).
+    adaptive_concurrency_enabled: bool = Field(
+        default=True,
+        description="False disables the middleware entirely -- every request is admitted, "
+        "same fail-open stance as a missing limiter.",
+    )
+    adaptive_concurrency_initial_limit: int = Field(default=20, ge=1)
+    adaptive_concurrency_min_limit: int = Field(default=5, ge=1)
+    # Sized loosely against db_pool_max_size (16): a limit far beyond the pool just means
+    # admitted requests queue on the pool instead of on this limiter -- the same failure mode
+    # this piece exists to avoid, one layer down.
+    adaptive_concurrency_max_limit: int = Field(default=64, ge=1)
+    adaptive_concurrency_window_seconds: float = Field(default=1.0, gt=0)
+    adaptive_concurrency_rtt_min_decay: float = Field(
+        default=0.05,
+        gt=0,
+        le=1.0,
+        description="Fraction rtt_min drifts toward a higher window minimum, per window. "
+        "Spec says 'decayed slowly' without a formula -- this is the interpretation.",
+    )
+    adaptive_concurrency_high_wait_seconds: float = Field(
+        default=0.25,
+        gt=0,
+        description="Bounded wait for a HIGH-criticality caller before it, too, sheds.",
+    )
+
     # ---- Outbox -------------------------------------------------------------
     outbox_batch_size: int = Field(default=100, ge=1)
     outbox_poll_interval_seconds: float = Field(default=0.2, gt=0)
@@ -256,6 +286,18 @@ class Settings(BaseSettings):
         ):
             raise ValueError(
                 "test_app_database_url must name the same database as test_database_url"
+            )
+        if not (
+            self.adaptive_concurrency_min_limit
+            <= self.adaptive_concurrency_initial_limit
+            <= self.adaptive_concurrency_max_limit
+        ):
+            raise ValueError(
+                "require adaptive_concurrency_min_limit <= "
+                "adaptive_concurrency_initial_limit <= adaptive_concurrency_max_limit, got "
+                f"{self.adaptive_concurrency_min_limit} <= "
+                f"{self.adaptive_concurrency_initial_limit} <= "
+                f"{self.adaptive_concurrency_max_limit}"
             )
         return self
 

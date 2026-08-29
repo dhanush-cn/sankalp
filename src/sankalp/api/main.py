@@ -1,9 +1,12 @@
 """FastAPI routes and Pydantic v2 request/response models.
 
-Three routes (docs/spec.md, "Phase 1 API"): submit, read, cancel. No new tables. Fronted by
+Three routes (docs/spec.md, "Phase 1 API"): submit, read, cancel. No new tables. Fronted by two
+middleware layers, outermost to innermost:
 :class:`~sankalp.api.middleware.RateLimitMiddleware` -- a Redis token bucket per route class,
 behind a circuit breaker that fails open (``resilience/ratelimit.py``, ``resilience/circuit.py``)
--- which is the piece that used to be described here as "not built."
+-- then :class:`~sankalp.api.middleware.AdaptiveConcurrencyMiddleware` -- a gradient/Vegas-style
+in-process concurrency limiter guarding this process's own slice of the DB pool
+(``resilience/adaptive.py``, docs/spec.md "Adaptive Concurrency").
 
 The app's pool is deliberately opened with no explicit ``dsn`` argument, so
 :func:`~sankalp.storage.pool.create_pool`'s default -- ``settings.active_app_database_url``,
@@ -25,9 +28,10 @@ from fastapi import FastAPI, Header, HTTPException, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from sankalp.api.middleware import RateLimitMiddleware
+from sankalp.api.middleware import AdaptiveConcurrencyMiddleware, RateLimitMiddleware
 from sankalp.config import get_settings
 from sankalp.engine.definition import registered_types
+from sankalp.resilience.adaptive import AdaptiveConcurrencyLimiter
 from sankalp.resilience.circuit import CircuitBreaker
 from sankalp.resilience.ratelimit import TokenBucketLimiter
 from sankalp.storage import workflows as workflow_storage
@@ -84,6 +88,29 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.limiter = None
         log.warning("rate limiting disabled (SANKALP_RATELIMIT_ENABLED=false)")
 
+    if settings.adaptive_concurrency_enabled:
+        concurrency_limiter = AdaptiveConcurrencyLimiter(
+            initial_limit=settings.adaptive_concurrency_initial_limit,
+            min_limit=settings.adaptive_concurrency_min_limit,
+            max_limit=settings.adaptive_concurrency_max_limit,
+            window_seconds=settings.adaptive_concurrency_window_seconds,
+            rtt_min_decay=settings.adaptive_concurrency_rtt_min_decay,
+            high_criticality_wait_seconds=settings.adaptive_concurrency_high_wait_seconds,
+        )
+        app.state.concurrency_limiter = concurrency_limiter
+        log.info(
+            "adaptive concurrency enabled: initial_limit=%d min_limit=%d max_limit=%d",
+            settings.adaptive_concurrency_initial_limit,
+            settings.adaptive_concurrency_min_limit,
+            settings.adaptive_concurrency_max_limit,
+        )
+    else:
+        # Same reasoning as the rate limiter's disabled branch: an explicit opt-out is logged
+        # the same as the enabled path, so a wiring gap never looks like a deliberate choice.
+        # AdaptiveConcurrencyMiddleware admits every request when this is unset.
+        app.state.concurrency_limiter = None
+        log.warning("adaptive concurrency disabled (SANKALP_ADAPTIVE_CONCURRENCY_ENABLED=false)")
+
     try:
         yield
     finally:
@@ -93,6 +120,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="sankalp", lifespan=_lifespan)
+# Order matters, and it is the opposite of what "first added" suggests: Starlette's
+# add_middleware() inserts at the front of its list, so the LAST call here ends up OUTERMOST
+# (hit first by a request) -- verified directly against this app's own built middleware stack,
+# not assumed. AdaptiveConcurrencyMiddleware is added first (innermost, closest to the route
+# handler, so the RTT it measures is purely handler execution time) and RateLimitMiddleware
+# second (outermost, so a 429 fires before a request ever reaches the concurrency gate).
+app.add_middleware(AdaptiveConcurrencyMiddleware)
 app.add_middleware(RateLimitMiddleware)
 
 

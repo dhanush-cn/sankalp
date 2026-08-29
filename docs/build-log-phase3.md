@@ -506,3 +506,220 @@ breaker timing, clock-skew bounding) under controlled, synthetic conditions — 
 production overload, with real network variance and real client behavior, hasn't been measured
 against this. The fail-proofs show the mechanism does what it claims when deliberately broken;
 they are not evidence of how it behaves under organic load.
+
+## 5. Adaptive concurrency — gradient admission, the resize primitive, and RTT that excludes the wait
+
+The rate limiter above caps *arrival rate* — how many requests per second a route class may
+admit — and fails open the instant Redis stops answering. It says nothing about how many of
+those admitted requests are simultaneously *inside* a handler, each holding a connection out of
+`db_pool_max_size` (16). A downstream slowdown can leave every admitted request well within its
+rate budget and still pile up in-process, each one waiting on Postgres, until the pool itself
+starts queueing — the rate limiter has no way to see that, because nothing about it is over
+budget by the only measure it tracks.
+
+Adaptive concurrency closes that gap: it watches real handler latency and shrinks how many
+requests this *specific API process* will run at once, before that pile-up happens. It is
+in-process and per-process, deliberately, and that is a difference in kind from the rate
+limiter, not just of degree — the rate limiter's state has to live in Redis because a
+requests/second budget is meaningless unless every replica agrees on it; concurrency is a
+property of *this* process's own slice of the pool, so each replica tracking its own is correct,
+not a gap. `resilience/adaptive.py` has no Redis dependency at all.
+
+It is also not the worker's `self._slots` semaphore (`engine/worker.py`), which bounds
+background step-execution concurrency, in a different process, sized from a static
+`worker_concurrency` setting. Two enforcement points, two different resources, two different
+processes — nothing here touches `worker.py`.
+
+Enforced as `AdaptiveConcurrencyMiddleware`, wired innermost of the two middleware layers
+(`api/main.py`): `RateLimitMiddleware` is added second, `AdaptiveConcurrencyMiddleware` first —
+which, per Starlette's actual stack-building order (see below), makes rate-limiting the
+outermost layer and concurrency the innermost. A 429 never reaches the concurrency gate, and the
+RTT the concurrency gate measures is purely the route handler's own execution time, with nothing
+else — not Redis round trips, not another middleware's work — mixed into it.
+
+### A registration-order bug caught before it shipped, not after
+
+The first version of this wiring added `RateLimitMiddleware` first and `AdaptiveConcurrencyMiddleware`
+second, on the assumption that Starlette wraps in first-added-is-outermost order — which is
+backwards. `add_middleware` inserts at the *front* of Starlette's internal list, so the *last*
+call ends up outermost. Verified directly, not assumed, by walking the app's own
+`build_middleware_stack()` output: the original order produced
+`ServerErrorMiddleware -> AdaptiveConcurrencyMiddleware -> RateLimitMiddleware -> router` — every
+request would have paid a concurrency-slot cost before a rate-limit rejection ever had the
+chance to turn it away for free. Swapping the two `add_middleware` calls and re-walking the
+stack confirmed `ServerErrorMiddleware -> RateLimitMiddleware -> AdaptiveConcurrencyMiddleware ->
+router`, the intended order. Both `api/main.py` and `api/middleware.py` now say so explicitly,
+with the verification method named in the comment, not just the conclusion.
+
+### The gradient control law, and rtt_min decay — an interpretation, not spec text
+
+Every `window_seconds` (default 1.0s), `AdaptiveConcurrencyLimiter._close_window` reduces
+whatever RTT samples `record_rtt` collected since the last close to one update, exactly per
+docs/spec.md:
+
+```
+gradient   = clamp(rtt_min / rtt_avg, 0.5, 1.0)
+new_limit  = limit * gradient + sqrt(limit)     # queue-size allowance
+limit      = clamp(new_limit, min_limit, max_limit)
+```
+
+The spec leaves one piece unspecified: `rtt_min` is "min RTT ever observed (decayed slowly)",
+with no formula for the decay. What's built is a stated interpretation of that phrase, not a
+transcription of it. A genuinely lower window minimum is adopted immediately — real capacity
+improved, there's no reason to wait on it. A window whose minimum is *higher* than the current
+`rtt_min` only nudges it up by `rtt_min_decay` (default 0.05) of the gap, rather than jumping
+straight there. At 5% per window, a permanent baseline shift takes on the order of twenty
+windows to be fully recognised as the new normal and let `gradient` return to 1.0 — slow enough
+that one noisy window can't yank the floor up and make the limiter permanently pessimistic, fast
+enough that a durably slower downstream dependency doesn't leave the limiter stuck reacting to a
+baseline that no longer exists. `test_rtt_min_decay_lets_the_limit_fully_recover_after_a_sustained_baseline_shift`
+proves both halves: 44 windows after a permanent shift from 0.010s to 0.030s, the decaying
+version recovers to a limit of 49; a frozen-`rtt_min` variant, built and run by hand for
+comparison, never leaves 5 — the floor — for the same 44 windows.
+
+### The corrected floor: `min_limit` holds the floor, it doesn't prevent a deadlock
+
+Planning-time reasoning for this fail-proof assumed that removing the outer
+`clamp(new_limit, min_limit, max_limit)` would drive `limit` toward zero or negative under
+sustained extreme RTT — a limiter that stops admitting anything, ever. Verified against the real
+implementation, that framing was wrong, and it's worth recording precisely why: the *inner*
+gradient clamp (`0.5, 1.0`) is untouched by that break, and a gradient pinned at its 0.5 floor
+has its own fixed point independent of any outer clamp — solve `0.5·limit + sqrt(limit) = limit`
+and the answer is `limit = 4`, not `limit = 0`. Sustained extreme RTT against an unclamped
+implementation converges there: `24, 16, 12, 9, 7, 6, 4, 4, ...` — suppressed, but never a
+deadlock. What `min_limit` actually does, demonstrated with `min_limit=10`: the clamped
+implementation holds exactly at 10 under the identical sustained-extreme-RTT sequence, visibly
+*above* where the gradient's own arithmetic would otherwise let it settle. `min_limit`'s job is
+holding the floor above that natural equilibrium, not preventing a failure mode — running the
+limiter into the ground — that the 0.5 gradient floor already rules out on its own.
+
+### The one hand-rolled primitive, proven first and alone: `_ResizableSemaphore`
+
+`asyncio.Semaphore` has no public resize API, and its capacity is fixed at construction — a
+gradient limiter needs to change that capacity every window without stranding whatever is
+already blocked on the old value. `_ResizableSemaphore` keeps one real `asyncio.Semaphore` alive
+for its whole lifetime and changes its capacity only through that semaphore's own public
+`acquire`/`release`: growing calls `release()` immediately for the delta; shrinking never
+touches the semaphore at all — an in-flight caller keeps the permit it already holds, so the
+gradient throttles *future* admission, never evicts current work — instead recording the
+shortfall as debt, paid down lazily as held permits are returned and silently swallowed instead
+of handed back. A grow that arrives while debt is still outstanding cancels the debt first,
+before releasing anything new, since a permit that was never actually removed costs nothing to
+un-remove. The invariant this rests on: at any instant, the real semaphore's embodied capacity
+(available + held) equals `target + debt`.
+
+This is the one place in this piece that isn't spec arithmetic — a real concurrency primitive,
+built by hand — and it was built and fail-proofed *before* any gradient or shedding logic was
+written on top of it, as its own reviewed diff. Two fail-proofs of its own: shrink by `d`, then
+immediately grow back by `d` before any permit returns, and drain the pool to count what's
+really acquirable. A broken variant that always issues a fresh `release()` on grow instead of
+cancelling outstanding debt first doubles the capacity instead of restoring it exactly —
+16 real permits acquirable where there should be 10. A harder, composed second case —
+`test_swallow_then_partial_grow_compose_correctly` — chains a partial swallow with a partial
+cancel and very nearly passed against that same broken code anyway: checking only the final
+count after several more permits were returned let the broken grow's extra permit get silently
+absorbed by a later, correct swallow, the exact same masking failure the "point of divergence"
+discipline below exists to catch. The fix was asserting immediately after the grow, before
+anything else could paper over it.
+
+### RTT excludes admission wait, or the limiter runs away
+
+`record_rtt` must be fed only real handler execution time — never any time a caller spent
+waiting to be admitted. The reasoning, stated in both `record_rtt`'s and
+`AdaptiveConcurrencyMiddleware`'s own docstrings: queueing time is a symptom of saturation, not
+of downstream latency. Folding it into RTT makes saturation *read as* rising latency, which
+shrinks `gradient`, which admits fewer requests, which means more callers hit the wait ceiling,
+which raises "RTT" further — a closed loop with nothing to break it, collapsing toward
+`min_limit` even when the real downstream never got slower at all. This is the subtlest
+correctness property in the design, and it's proven twice, not once:
+
+- **A synthetic proof**, built before any real `acquire()`/middleware call site existed: the
+  same real `AdaptiveConcurrencyLimiter`, fed two RTT sequences by the test's own driving loop —
+  one excluding a simulated bounded wait under sustained saturation, one including it. Excluding
+  it holds the limit near `max_limit`; including it collapses to `min_limit` and never recovers.
+  Necessarily a comparison, not a break/revert, because the code path it was meant to protect
+  didn't exist yet.
+- **A real proof, once it did.** `test_middleware_rtt_excludes_admission_wait_under_real_saturation`
+  breaks the actual call site — moving `started = time.monotonic()` in
+  `AdaptiveConcurrencyMiddleware.__call__` to before `async with limiter.acquire(criticality)`
+  instead of after — and drives 100 real concurrent `HIGH` requests for 1.5 real seconds against
+  a route whose handler sleeps a constant 3ms, `initial_limit=10`, `min_limit=8`. Correct: the
+  limit grows and holds in the high teens to low twenties. Broken: it collapses to `min_limit=8`
+  within a few windows and stays there. Reverted immediately after confirming.
+
+  Getting a clean, real-HTTP version of this took two corrections against the first attempt.
+  Driving it through `httpx.AsyncClient` + `ASGITransport` at the concurrency this needs (dozens
+  of simultaneous callers) turned out to add enough of its own real scheduling/transport
+  overhead to inflate measured RTT in *both* the correct and the broken variant, masking the
+  effect being isolated — the test now drives the real middleware through hand-built raw ASGI
+  `scope`/`receive`/`send` instead, which removes that confound while still exercising the real
+  code. And `initial_limit`/`min_limit` had to sit well above the gradient floor's own natural
+  equilibrium (~4, see above) — too close to it, and the difference between "suppressed" and
+  "collapsed" disappears into integer truncation.
+
+### Criticality defaults to `LOW`, and the reason it's safe is idempotency, not a generous default
+
+`Criticality` (a `Criticality: high|low` request header, read the same way the rate limiter
+avoids ever reading the request body) has two defensible defaults, and the less obvious one was
+chosen. Default-`HIGH` looks safer at a glance — undeclared traffic isn't deprioritized — but
+`HIGH` isn't actually protection from a 503, only a bounded wait before one; if most callers
+never learn about the header, which is the realistic rollout case, everything is `HIGH` by
+default, `LOW`-shedding never fires, and the whole criticality mechanism ships as dead weight.
+Default-`LOW` is the backward-compatible choice instead: before this middleware existed, no
+request got special treatment under overload, so undeclared traffic keeping that same
+best-effort behaviour changes nothing for it; `HIGH` becomes something a caller deliberately
+claims for a genuinely critical path.
+
+The reason this is *safe* for a money-movement API specifically has nothing to do with the
+limiter picking a generous default: a shed 503 on `POST /workflows` costs one retry, not a lost
+or duplicated payment, because `Idempotency-Key` is already required on every submit
+(`api/main.py`) and the whole engine's guarantee is retry-safe, idempotent effects via
+at-least-once execution — not exactly-once delivery. Safety here comes from the idempotency
+guarantee this system already had before this piece existed, not from this piece being cautious
+on a caller's behalf.
+
+### What proves it
+
+Nine fail-proofs and 14 tests (273 lines in `resilience/adaptive.py`, 505 in
+`test_adaptive.py`), each built by breaking the mechanism first — a real line of production code
+temporarily changed, not a hypothetical — and watching the test catch it before reverting:
+
+1. Skip the gradient term entirely (pin it at 1.0): limit grows in the very window RTT spikes
+   10x, instead of shrinking — caught at 28 where 24 was expected.
+2. Drop the `+ sqrt(limit)` growth term: limit stays exactly flat the very window RTT recovers
+   to baseline, instead of growing back — caught at 16 where >16 was expected.
+3. Remove the outer clamp, sustained extreme RTT: limit sags to 6 where `min_limit=10` should
+   hold it — see the corrected reasoning above.
+4. Remove the outer clamp, sustained stable low RTT: limit climbs to 97 past `max_limit=64`
+   with nothing to stop it.
+5. Freeze `rtt_min` (no decay): stuck at the floor (5) 44 windows after a sustained, stable
+   baseline shift that the decaying version fully recovers from (49) in the same span.
+6. Remove `LOW`'s non-blocking fast path: it waits the full ~0.2s ceiling like `HIGH` under
+   real saturation, instead of shedding in under 0.05s.
+7. The resize primitive: shrink by `d`, grow back by `d` before anything returns — a broken
+   grow that doesn't cancel outstanding debt first doubles capacity (16 acquirable where 10 was
+   expected) instead of restoring it exactly.
+8. The resize primitive, composed: a partial swallow chained with a partial cancel, asserted
+   immediately after the grow rather than after later releases could mask it — the point-of-
+   divergence discipline every fail-proof above was checked against.
+9. RTT-excludes-queueing, proven twice — synthetic (before the middleware existed) and, once it
+   did, a real break/revert against the actual call site under 100 concurrent real requests
+   (above).
+
+Crash gates unaffected — this piece touches no worker, dequeue, or checkpoint path, so
+`tests/test_crash.py` and friends weren't expected to move and didn't.
+
+### What's not built yet
+
+No load testing: everything above is a unit-level proof of the mechanism — the gradient shrinks
+and recovers, both clamps hold, `rtt_min` decay lets a permanent shift be recognised, `LOW`
+sheds before `HIGH`, the resize primitive is lossless, RTT genuinely excludes admission wait —
+under controlled, synthetic or small-scale-real conditions. A real production overload, with
+real payload-size variance, real Postgres contention, and a real arrival-rate distribution,
+hasn't been measured against this. The fail-proofs show the mechanism does what it claims when
+deliberately broken; they are not evidence of how it behaves under organic load. Whether P99 of
+*admitted* requests actually stays bounded under sustained real overload is the Phase 3 gate's
+claim (`docs/spec.md`: "ramp to 5x measured capacity... Grafana panel where concurrency limit
+drops as latency climbs"), and it needs two things that don't exist in this repo yet: a
+load-generation harness, and a metrics/Grafana pipeline (the same gap `resilience/ratelimit.py`
+was already built against). Nothing here should be read as having closed that gap.
