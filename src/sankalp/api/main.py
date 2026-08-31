@@ -54,6 +54,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     import sankalp.workflows  # noqa: F401
 
     settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    )
     pool = await create_pool()
     app.state.pool = pool
 

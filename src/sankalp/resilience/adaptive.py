@@ -43,11 +43,14 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import json
+import logging
 import math
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 __all__ = [
     "AdaptiveConcurrencyLimiter",
@@ -55,6 +58,8 @@ __all__ = [
     "Criticality",
     "_ResizableSemaphore",
 ]
+
+log = logging.getLogger("sankalp.adaptive")
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -203,7 +208,8 @@ class AdaptiveConcurrencyLimiter:
 
     @property
     def limit(self) -> int:
-        """The current adaptive limit -- a field/log a metric could read (none exists yet)."""
+        """The current adaptive limit -- also emitted by ``_close_window`` as the
+        ``adaptive_concurrency.window_closed`` log event on every window close."""
         return self._limit
 
     @asynccontextmanager
@@ -268,6 +274,19 @@ class AdaptiveConcurrencyLimiter:
             new_limit = self._limit * gradient + math.sqrt(self._limit)
             self._limit = int(_clamp(new_limit, self._min_limit, self._max_limit))
             self._pool.resize(self._limit)
+
+            log.info(
+                json.dumps(
+                    {
+                        "event": "adaptive_concurrency.window_closed",
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "limit": self._limit,
+                        "rtt_avg_s": rtt_avg,
+                        "rtt_min_s": self._rtt_min,
+                        "gradient": gradient,
+                    }
+                )
+            )
 
         self._window_samples = []
         self._window_start = self._clock()
