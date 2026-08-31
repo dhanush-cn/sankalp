@@ -11,3 +11,5 @@ venv/
 .coverage
 htmlcov/
 *.log
+loadtest/results/*/raw_http.jsonl
+loadtest/results/*/api.log
