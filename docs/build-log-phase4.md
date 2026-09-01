@@ -326,3 +326,43 @@ unproxied connection, and reconciliation would have reported green against a dat
 injected fault never touched. The general hazard this leaves behind: a module-level pool
 resolved from `settings` follows `SANKALP_ENVIRONMENT`, not the engine's actual connection —
 worth checking explicitly the next time any workflow module opens a pool of its own.
+
+---
+
+## 10. The outbox invariant had the same defect as reconciliation
+
+`check_outbox_drained` (`tests/chaos/invariants.py`) was passing in chaos scenario 1 for the same
+reason `check_reconciliation` used to (Section 9, before `demo_transfer`): nothing under
+`src/sankalp/workflows/` ever called `ctx.emit`, so no production workflow had ever written an
+`outbox` row, and the invariant ran against an empty table. `grep -rn "\.emit(" src tests` found
+every call site: `tests/test_outbox.py`'s seven throwaway definitions, and nothing else — the
+mechanism had no production caller. `sankalp_test.outbox` was confirmed empty after a full
+`make test` run, before this fix.
+
+**The distinction that matters here.** The transactional outbox mechanism itself is not
+under-tested — `tests/test_outbox.py` already covers forward steps, retries, compensations, and a
+payload-serialisation failure. What was missing was any *production* workflow exercising it,
+which is what made the chaos-suite invariant vacuous. A well-tested mechanism and a wired-up one
+are different claims, and this repo had the first without the second.
+
+**Fix: `post_credit` now emits `transfer.posted`.** After its ledger `INSERT` succeeds,
+`post_credit` (`src/sankalp/workflows/transfer.py`) calls `ctx.emit` with `transfer_id` (`str(
+ctx.workflow_id)`), `source_account`, `destination_account`, `amount_minor`, and `currency` —
+plain JSON, matching what `engine/definition.py` persists to `outbox.payload` (`jsonb`). Only the
+credit leg emits: the event announces a completed double entry, and a debit alone is not a
+transfer, so `post_debit` stays silent. The compensation path emits nothing either — whether a
+reversal should announce its own event is a separate decision, not made here.
+
+**Revert-proof.** Deleting the `ctx.emit` call from `post_credit` leaves everything else
+(docstring, the now-unused local variables) untouched, and fails
+`test_post_credit_emits_exactly_one_transfer_posted_event` at the row count — `assert 0 == 1` —
+with the other five tests in the file unaffected, since none of them depend on the emitted event.
+Reverted immediately after confirming.
+
+`tests/test_transfer.py` is now 6 tests, all passing; full suite `204 passed, 1 deselected`.
+
+**The pattern worth carrying forward.** Two of the five chaos invariants — reconciliation and now
+the outbox drain — turned out to be passing against empty tables. Both were found the same way:
+by asking what in `src/` actually writes the table each invariant reads, not by reading the
+invariant's own query. An invariant that has never been seen to fail is not yet a check; the
+other three chaos invariants haven't had this question asked of them yet.
