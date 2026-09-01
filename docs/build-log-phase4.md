@@ -239,7 +239,7 @@ loadtest/scripts/run_scenario.sh as-configured 2500
 `docs/phase4-raw-findings.md`'s "Results directories" section maps each of these to where its
 artifacts actually live.
 
-**Three known gaps, not fixed here:**
+**Two known gaps, not fixed here:**
 
 - `STEPS` and `SLEEP_SECONDS` are read by the k6 scripts via `__ENV`, which only sees values
   passed as explicit `-e VAR=value` flags to `k6 run` — k6 does not read arbitrary process
@@ -253,15 +253,76 @@ artifacts actually live.
   work, which is why the four directories in Section 4/5/6 above exist under renamed,
   rate-and-floor-qualified names rather than the script's own default output paths — the
   renaming is a manual step after each run, not something `run_scenario.sh` does for you.
-- **The chaos suite's DB-latency scenario does not prove reconciliation under fault.** The
-  Phase 4 Gate (below) requires the chaos suite to show "the reconciliation query still nets
-  to zero" under injected faults. `tests/chaos/test_chaos_db_latency.py` calls
-  `chaos.invariants.check_all`, which includes the reconciliation check, but nothing in `src/`
-  currently writes `ledger_entries` for the `demo_crash` workflow that scenario submits
-  (`grep -rln ledger_entries src/` returns nothing outside migrations) — the query runs
-  against an empty table and passes vacuously. The scenario's other four invariants (no stuck
-  workflow, outbox drained, no duplicate side effects, no `FAILED_DIRTY`) are genuinely
-  exercised; reconciliation is not. Closing this needs a workflow whose steps actually post
-  balanced double-entry `ledger_entries` rows under the same fault; once one exists, the
-  scenario's existing `check_all` call starts asserting reconciliation for real with no test
-  change required.
+
+**Closed:** the chaos suite's DB-latency scenario not proving reconciliation under fault
+(formerly the third gap here) is closed by commit `085327c` — see Section 9.
+
+---
+
+## 9. Reconciliation under fault, for real: `demo_transfer`
+
+Closes the gap Section 8 used to list third: `tests/chaos/test_chaos_db_latency.py` called
+`chaos.invariants.check_all`, including the reconciliation check, but nothing in `src/` wrote
+`ledger_entries` — the query ran against an empty table and passed vacuously. Commit `085327c`
+adds `demo_transfer` (`src/sankalp/workflows/transfer.py`), a workflow that actually posts to
+the ledger, so that check has something to fail against.
+
+**Two forward steps, in separate transactions, on purpose.** `post_debit` and `post_credit`
+each commit their own `ledger_entries` row independently — the same double entry posted in one
+step, one transaction, would make a transiently unbalanced ledger unobservable, since either
+both rows commit or neither does. Reconciliation would then have nothing to ever catch, which
+is exactly the vacuity this workflow exists to remove. Splitting them means a crash (or an
+injected fault) between the two leaves exactly one leg posted, which reconciliation must — and
+does — see as unbalanced until the second leg lands or the first is reversed.
+
+**Idempotent by construction — the opposite design choice from `demo_crash` and
+`demo_unwind`.** Both steps write with `ON CONFLICT ... DO NOTHING` against the pre-existing
+`uq_ledger_entry` constraint (`workflow_id, step_name, account_id, direction` —
+`migrations/003_saga.sql`), so a replayed step posts nothing extra. `demo_crash` and
+`demo_unwind` are deliberately the reverse: their crash gates count raw attempts, and an
+idempotent write there would make the gate pass whether or not crash recovery actually worked.
+`demo_transfer` must never be cited as evidence of exactly-once *effects* — it proves nothing
+about execution counts, only about reconciliation. Compensation follows the same append-only
+discipline as the rest of the ledger: a reversal is a new, opposite-direction entry, never an
+`UPDATE` or `DELETE`.
+
+**Three revert-proofs, each breaking a different mechanism and failing at the point of
+divergence:**
+
+- Deleting the `ON CONFLICT ... DO NOTHING` clause: the first invocation of a step still
+  succeeds; a second, real invocation of the same step against the same workflow now raises
+  `UniqueViolationError` on `uq_ledger_entry` directly, instead of being silently absorbed.
+- Generating `transfer_id` from a fresh `uuid4()` per step instead of using `ctx.workflow_id`:
+  `RECONCILE` returned two unbalanced groups for what should have been one balanced transfer —
+  `debits=500_00, credits=0` and `debits=0, credits=500_00` — because the debit and credit,
+  now under different `transfer_id`s, are read as two independent one-sided transfers instead
+  of one balanced pair.
+- Changing `reverse_debit` to post `direction="DEBIT"` instead of `"CREDIT"`: the compensation
+  still ran and the workflow still reached `COMPENSATED` (the row's
+  `(workflow_id, step_name, account_id, direction)` key is distinct from the forward row's, so
+  no constraint catches it), but it doubled the
+  debit instead of reversing it — caught by the test's explicit assertion on the reversal's
+  `direction`, not by reconciliation, since that particular test never reaches the `RECONCILE`
+  check.
+
+Each was reverted immediately after confirming the failure. `tests/test_transfer.py`, 5 tests,
+all passing; full suite `203 passed, 1 deselected` (the chaos scenario itself, which needs the
+Toxiproxy container and is excluded from `make test` by design).
+
+**A separate finding, not part of the gap this section closes.** `transfer.py` opens its own
+module-level pool from `settings.active_app_database_url` (`sankalp.storage.pool.create_pool`)
+rather than reusing `workflows/_instrumentation.py`'s `get_pool()`. Two reasons, not one.
+First, `ledger_entries` is a business table, not instrumentation — `sankalp_app` holds
+`SELECT`/`INSERT` on it (`migrations/004_restricted_role.sql`), unlike
+`side_effects`/`step_attempts`/`crash_gates`, which have no `sankalp_app` grants at all — so it
+should be written through the restricted role the worker actually executes on, not the owning
+role `_instrumentation.get_pool()` deliberately uses for the crash-gate tables. Second, and the
+reason that actually matters for the chaos suite: `active_app_database_url` is exactly what
+`tests/fleet.py`'s `WorkerFleet.launch` overrides via
+`extra_env={"SANKALP_TEST_APP_DATABASE_URL": ...}` to route a worker through the Toxiproxy
+Postgres proxy. `_instrumentation.get_pool()`'s `active_database_url` is never overridden by a
+chaos test — reusing it would have sent `demo_transfer`'s ledger writes over a direct,
+unproxied connection, and reconciliation would have reported green against a database the
+injected fault never touched. The general hazard this leaves behind: a module-level pool
+resolved from `settings` follows `SANKALP_ENVIRONMENT`, not the engine's actual connection —
+worth checking explicitly the next time any workflow module opens a pool of its own.
