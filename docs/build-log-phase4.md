@@ -239,7 +239,7 @@ loadtest/scripts/run_scenario.sh as-configured 2500
 `docs/phase4-raw-findings.md`'s "Results directories" section maps each of these to where its
 artifacts actually live.
 
-**Two known gaps, not fixed here:**
+**Three known gaps, not fixed here:**
 
 - `STEPS` and `SLEEP_SECONDS` are read by the k6 scripts via `__ENV`, which only sees values
   passed as explicit `-e VAR=value` flags to `k6 run` — k6 does not read arbitrary process
@@ -253,3 +253,15 @@ artifacts actually live.
   work, which is why the four directories in Section 4/5/6 above exist under renamed,
   rate-and-floor-qualified names rather than the script's own default output paths — the
   renaming is a manual step after each run, not something `run_scenario.sh` does for you.
+- **The chaos suite's DB-latency scenario does not prove reconciliation under fault.** The
+  Phase 4 Gate (below) requires the chaos suite to show "the reconciliation query still nets
+  to zero" under injected faults. `tests/chaos/test_chaos_db_latency.py` calls
+  `chaos.invariants.check_all`, which includes the reconciliation check, but nothing in `src/`
+  currently writes `ledger_entries` for the `demo_crash` workflow that scenario submits
+  (`grep -rln ledger_entries src/` returns nothing outside migrations) — the query runs
+  against an empty table and passes vacuously. The scenario's other four invariants (no stuck
+  workflow, outbox drained, no duplicate side effects, no `FAILED_DIRTY`) are genuinely
+  exercised; reconciliation is not. Closing this needs a workflow whose steps actually post
+  balanced double-entry `ledger_entries` rows under the same fault; once one exists, the
+  scenario's existing `check_all` call starts asserting reconciliation for real with no test
+  change required.
