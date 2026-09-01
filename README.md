@@ -166,6 +166,112 @@ Three real-process crash gates run under repetition (each `SIGKILL`s an actual w
 drain subprocess, not a cancelled task): forward recovery, compensation recovery, and
 drain at-least-once.
 
+## Phase 4 Gate
+
+`docs/spec.md`'s Phase 4 Gate was rescoped to: a reproducible load-test results table with
+hardware stated, committed limit-vs-RTT time series, overload behavior proven under both
+criticality classes, an honest methodology section, and a chaos suite. The load-testing half is
+closed; the chaos suite is one scenario built, one more cited to an existing test, and the rest
+of `docs/spec.md`'s fault table deferred outright, below.
+
+### Results, measured
+
+One machine — an Intel Core 7 240H laptop (8 cores / 16 threads) — ran the load generator (k6),
+the API, the workers, Postgres, and Redis simultaneously. Nothing here was measured across a
+network.
+
+| Rate (rps) | p99 | Note |
+|---|---|---|
+| 200 | 40.8ms | |
+| 400 | 81.5ms | |
+| 450 | 48.0ms | |
+| 500 | 43.4ms | **capacity** |
+| 550 | 1114ms | partial — n=8139, aborted at 15.9s on the `dropped_iterations` guard — **the corner** |
+
+p99 is flat across 40–80ms through 500 rps — flat in aggregate, not a clean curve: 400 rps is the
+worst point in the band at 81.5ms, above both 450 rps (48.0ms) and 500 rps (43.4ms). The 550 rps
+row is a partial sample from a run that aborted before completing its step, not a finished
+measurement — but at ~26× the 500 rps figure, it shows the corner plainly. By Little's Law, 500
+rps at the flat band's ~7ms average latency implies ~3.5 requests in flight at capacity.
+
+The adaptive concurrency limiter finds that number on its own, independently: at 750 rps (1.4×
+capacity) with `min_limit` lowered to 2, it converges to a limit of 4 — 165 of 180 one-second
+windows sat exactly there. At 2500 rps (5×) with the shipped default `min_limit=5`, it instead
+pins at the floor — 176 of 180 windows at exactly 5. That's the floor setting the operating
+point, not the gradient converging; the equilibrium it would otherwise find (4) sits one below
+where the floor stops it.
+
+With both limiters on as shipped, at 2500 rps: the Redis token-bucket rate limiter shed 113 of
+roughly 450,000 requests — 0.025%, nearly inert. The concurrency limiter, pinned at its floor,
+did essentially all of the shedding.
+
+### Limit vs. RTT, as data
+
+Committed under `loadtest/results/`: `adaptive-isolated-750-min2/` and
+`adaptive-isolated-2500-min5/`, each holding `adaptive_timeseries.csv`, `rtt_timeseries.csv`, and
+a rendered `timeseries.png`. The figure in each stacks the admission limit on top against RTT
+p99, split by criticality, on the same time axis below — so the limit's descent and its effect
+on tail latency read off the same plot.
+
+### Overload behavior
+
+`HIGH_FRACTION=0.2` — HIGH is a fifth of offered load throughout.
+
+- **750 rps (1.4× capacity, `min_limit=2`):** HIGH 27,001 admitted, 0 shed. LOW 61,211 admitted,
+  46,789 shed. Admitted p99: HIGH 32.4ms, LOW 17.1ms.
+- **2500 rps (5× capacity, shipped `min_limit=5`):** HIGH admission ran 50.5%, 61.4%, and 61.5%
+  across three identical runs — a range, not a single figure. LOW: 253 admitted against 359,748
+  shed (0.07%) — effectively closed out. Admitted p99: HIGH 299.6ms, LOW 750.2ms.
+- **Rejection is cheap; admission can be slow.** A shed LOW request returns in p50 0.70ms at 750
+  rps and 1.17ms at 2500 rps — refusing work costs almost nothing. A shed HIGH request at 2500
+  rps returns in p50 251.4ms, which is `high_criticality_wait_seconds` (0.25s, `adaptive.py`)
+  expiring: LOW is refused with no wait at all, HIGH waits a bounded quarter-second for a permit
+  and is only refused once none frees up in that window.
+- **Two different questions.** At 5×, client-observed durations are dominated by that configured
+  wait — but the limiter's own recorded RTT deliberately excludes admission time
+  (`adaptive.py`'s `record_rtt` docstring: never fold in time spent queued waiting for
+  admission). The admitted-p99 figures above and the shed-request return times above are not
+  comparable to each other; they answer different questions.
+
+### Methodology and its limits
+
+Every number above was generated and measured on the same laptop — generator contention is
+inside every figure here, not netted out. That laptop ran everything under WSL2 on Windows:
+Postgres and Redis in Docker containers inside that VM, not on bare metal — a further qualifier
+on the measured ceiling alongside the same-machine caveat. The measured ceiling is a property of
+this setup, not a claim about the software's ceiling on real hardware. A separate control run
+drove 2500 rps against `/openapi.json` (bypasses all rate-limiting/concurrency middleware) and
+sustained it cleanly, confirming 2500 rps was achievable from this generator on this host before
+trusting any number measured against it. Run-to-run variance at 5× was real: the limiter's
+*behavior* was deterministic across repeats (floor-pinned, same descent shape every time), but
+the *admission percentage* that behavior produced was not — see the three-run range above, not a
+single number.
+
+### Chaos suite
+
+One scenario is built (DB latency), one more is cited to an existing test (worker killed
+mid-step), and the rest of `docs/spec.md`'s fault table is deferred outright.
+
+- **DB latency +500ms** — `tests/chaos/test_chaos_db_latency.py`, via Toxiproxy.
+- **Worker killed mid-step** — cited to `tests/test_crash.py`, which aims the kill
+  deterministically at a step already in flight and asserts `step_attempts == 2` against
+  `side_effects == 1`: attempted twice, took effect once.
+
+Both faults are checked against five shared invariants in `tests/chaos/invariants.py`. Two of
+those five — reconciliation and outbox drain — were passing against **empty tables** until
+commit `085327c` and the commits after it: no production workflow posted to `ledger_entries` or
+called `ctx.emit` before then, so both checks ran against nothing and passed vacuously. The
+DB-latency scenario now alternates `demo_crash` and `demo_transfer` submissions so all five
+invariants have real data to check. Evidence from a green run: 300 `demo_crash` and 300
+`demo_transfer` workflows in `SUCCESS`, 600 `ledger_entries` rows, 300 outbox rows all
+published.
+
+Deferred, not built — the rest of `docs/spec.md`'s chaos fault table: DB connection cut, Redis
+down, network partition worker↔DB, gateway 500s/timeouts, and zombie worker (`SIGSTOP`/
+`SIGCONT`). The zombie-worker case matters most of these: fencing-token rejection is a Phase 1
+claim, and it has never been tested against a worker actually stalled mid-write, only against
+the crash-recovery path.
+
 ## Running it
 
 Requires Docker (Postgres 16 + Redis 7) and Python 3.14.
@@ -209,9 +315,9 @@ edges are is the point.
 - **Single-region, single-primary Postgres.** Coordination correctness relies on
   linearizable writes to one primary. This buys `SKIP LOCKED`, advisory locks, and
   fencing without a consensus layer — at the cost of a single-region ceiling.
-- **No benchmarks.** There are no performance numbers in this README because none have
-  been measured. The design has a known throughput ceiling (WAL group-commit on a single
-  queue), but a real figure requires a real load test.
+- **Benchmarks are single-machine, not distributed.** See [Phase 4 Gate](#phase-4-gate) for
+  measured numbers — capacity, overload behavior, and their caveats. What's still missing is a
+  load generator on separate hardware from the system under test.
 - **Ledger immutability is enforced at two layers.** A row-level trigger blocks
   `UPDATE`/`DELETE` on `ledger_entries`. It cannot see `TRUNCATE` — that's not a row
   operation, so it never fires a row trigger — so the second layer is the `sankalp_app`
@@ -225,14 +331,14 @@ edges are is the point.
 
 ## Roadmap
 
-Phases 1 and 2 (above) are complete, tested, and the shippable core. Planned:
+Phases 1 through 3 (above) are complete, tested, and the shippable core — resilience (Redis
+token-bucket rate limiting, adaptive concurrency, the restricted `sankalp_app` database role)
+included. Planned:
 
-- **Resilience (Phase 3):** Redis token-bucket rate limiting and adaptive concurrency.
-  (The restricted `sankalp_app` database role is done — see "Ledger immutability is
-  enforced at two layers" above.)
 - **Observability (Phase 4):** OpenTelemetry tracing threaded through the outbox's
   `trace_context` column, and Prometheus metrics for queue depth, lease churn, and drain
-  lag.
+  lag. The [Phase 4 Gate](#phase-4-gate)'s load-test results and first chaos scenario are
+  done; tracing and dashboards are what's left.
 
 ## Build notes
 
