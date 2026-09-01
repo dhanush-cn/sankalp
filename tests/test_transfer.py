@@ -35,6 +35,7 @@ Four properties:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from collections.abc import AsyncIterator
 
@@ -176,6 +177,27 @@ async def ledger_rows(pool, workflow_id) -> list[dict]:
     return [dict(r) for r in records]
 
 
+async def outbox_rows(pool, workflow_id) -> list[dict]:
+    """Rows from ``outbox`` for one workflow, with ``payload`` (jsonb) decoded to a dict.
+
+    ``outbox.payload`` is ``jsonb`` (migrations/003_saga.sql, ``storage/outbox.py``'s
+    ``_INSERT_EVENT_SQL``), and this pool has no ``jsonb`` codec registered, so it comes back
+    as text unless cast -- same reasoning as ``storage/outbox.py``'s own module docstring.
+    Cast it to ``::text`` here and decode with ``json.loads``, rather than relying on any
+    codec this fixture's pool may or may not have.
+    """
+    records = await pool.fetch(
+        """
+        SELECT event_type, payload::text AS payload
+        FROM outbox
+        WHERE workflow_id = $1
+        ORDER BY id
+        """,
+        workflow_id,
+    )
+    return [{"event_type": r["event_type"], "payload": json.loads(r["payload"])} for r in records]
+
+
 # ---------------------------------------------------------------------------
 # 1. The happy path: a genuine balanced double entry.
 # ---------------------------------------------------------------------------
@@ -213,6 +235,39 @@ async def test_happy_path_posts_a_balanced_double_entry_and_reconciles(
     assert credit["transfer_id"] == workflow_id
 
     assert await pool.fetch(RECONCILE) == []
+
+
+async def test_post_credit_emits_exactly_one_transfer_posted_event(pool, insert_workflow, settings):
+    """What this proves: ``post_credit`` writes exactly one ``transfer.posted`` row to
+    ``outbox``, in the same transaction as its ledger INSERT, with a payload matching what was
+    submitted -- proving ``ctx.emit`` is actually wired to a production workflow rather than
+    only exercised by ``tests/test_outbox.py``'s unit-level coverage of the mechanism itself
+    (see ``transfer.py``'s ``post_credit`` docstring for why that gap mattered: before this,
+    ``tests/chaos/invariants.py``'s ``check_outbox_drained`` ran against a table no real
+    workflow had ever written to).
+    """
+    submitted = {
+        "source_account": "acct:G",
+        "destination_account": "acct:H",
+        "amount_minor": 175_00,
+        "currency": "INR",
+    }
+    workflow_id = await insert_workflow(workflow_type=WORKFLOW_TYPE, input=submitted)
+
+    result = await execute_workflow(pool, await claim_one(pool), settings=settings)
+    assert result is ExecutionResult.SUCCESS
+
+    events = await outbox_rows(pool, workflow_id)
+    assert len(events) == 1
+    event = events[0]
+    assert event["event_type"] == "transfer.posted"
+    assert event["payload"] == {
+        "transfer_id": str(workflow_id),
+        "source_account": submitted["source_account"],
+        "destination_account": submitted["destination_account"],
+        "amount_minor": submitted["amount_minor"],
+        "currency": submitted["currency"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +316,11 @@ async def test_compensation_reverses_only_the_leg_that_posted_and_stays_balanced
     assert reversal["transfer_id"] == workflow_id
 
     assert await pool.fetch(RECONCILE) == []
+
+    assert await outbox_rows(pool, workflow_id) == [], (
+        "post_credit never ran -- fail_after='post_debit' raised before it started -- so "
+        "no transfer.posted event should exist for this workflow"
+    )
 
 
 # ---------------------------------------------------------------------------

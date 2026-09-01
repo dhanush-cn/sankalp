@@ -220,11 +220,35 @@ class DemoTransfer:
 
     @step(seq=2)
     async def post_credit(self, ctx: StepContext) -> dict[str, Any]:
-        """Post the CREDIT leg against the destination account, same amount and transfer."""
+        """Post the CREDIT leg against the destination account, same amount and transfer.
+
+        Emits ``transfer.posted`` after the ledger INSERT succeeds -- the only ``ctx.emit``
+        call anywhere under ``src/sankalp/workflows/`` before this one. Every other workflow
+        in this package left ``outbox`` untouched, so no real workflow ever wrote a row there,
+        and ``tests/chaos/invariants.py``'s ``check_outbox_drained`` was running against an
+        empty table in chaos scenario 1 -- the same vacuity ``check_reconciliation`` had before
+        this module existed (see the module docstring). The outbox mechanism itself is already
+        covered by ``tests/test_outbox.py``; what was missing was a production workflow that
+        actually exercises it. Only the credit leg emits: the event announces a completed
+        double entry, and a debit alone is not a transfer, so ``post_debit`` emits nothing.
+        """
         _maybe_fail_before(ctx, "post_credit")
+        source = str(ctx.input.get("source_account", "acct:source"))
         destination = str(ctx.input.get("destination_account", "acct:destination"))
+        amount_minor = int(ctx.input.get("amount_minor", 100_00))
+        currency = str(ctx.input.get("currency", "INR"))
         await _post_entry(
             ctx, step_name="post_credit", account_id=destination, direction="CREDIT"
+        )
+        ctx.emit(
+            "transfer.posted",
+            {
+                "transfer_id": str(ctx.workflow_id),
+                "source_account": source,
+                "destination_account": destination,
+                "amount_minor": amount_minor,
+                "currency": currency,
+            },
         )
         return {"account_id": destination}
 
