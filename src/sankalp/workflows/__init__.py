@@ -9,6 +9,6 @@ A definition that is not imported here is invisible to a worker process, which s
 the worker claiming a workflow, failing to resolve its type, and leaving the row to its lease.
 """
 
-from sankalp.workflows import demo, unwind  # noqa: F401
+from sankalp.workflows import demo, transfer, unwind  # noqa: F401
 
-__all__ = ["demo", "unwind"]
+__all__ = ["demo", "transfer", "unwind"]
