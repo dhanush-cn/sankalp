@@ -17,6 +17,7 @@ import uuid
 from collections.abc import Sequence
 
 import pytest
+from chaos.invariants import unpublished_count
 
 from sankalp.config import Settings
 from sankalp.engine.drain import DrainLoop
@@ -36,8 +37,9 @@ async def insert_events(
         )
 
 
-async def unpublished_count(pool) -> int:
-    return await pool.fetchval("SELECT count(*) FROM outbox WHERE published_at IS NULL")
+# unpublished_count now lives in tests/chaos/invariants.py -- the chaos suite's "outbox
+# fully drained" invariant is the same question these tests ask, and one definition is what
+# stops the two from drifting. Imported above; the tests below still guard it.
 
 
 class RaisingPublisher:

@@ -20,20 +20,13 @@ import uuid
 
 import asyncpg
 import pytest
+from chaos.invariants import RECONCILE
 
 from sankalp.config import get_settings
 
-#: docs/spec.md, "Reconciliation" -- verbatim. Every transfer must net to zero, so this
-#: returns the transfers that do not. It must return no rows, always.
-RECONCILE = """
-SELECT transfer_id,
-       SUM(CASE WHEN direction='DEBIT'  THEN amount_minor ELSE 0 END) AS debits,
-       SUM(CASE WHEN direction='CREDIT' THEN amount_minor ELSE 0 END) AS credits
-FROM ledger_entries
-GROUP BY transfer_id
-HAVING SUM(CASE WHEN direction='DEBIT'  THEN amount_minor ELSE 0 END)
-    <> SUM(CASE WHEN direction='CREDIT' THEN amount_minor ELSE 0 END)
-"""
+# RECONCILE now lives in tests/chaos/invariants.py, so the chaos suite's invariant 1 and
+# the two tests below run the same text rather than two copies that can drift. The tests
+# stay here: they are what proves the shared constant can both pass and fail.
 
 
 async def _post(conn, workflow_id, **overrides):
