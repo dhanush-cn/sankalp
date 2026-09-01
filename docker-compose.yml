@@ -54,5 +54,33 @@ services:
       retries: 30
     restart: unless-stopped
 
+  # Network-level fault injection for the Phase 4 chaos suite -- DB latency, connection
+  # cuts, a worker<->DB partition, Redis down. 8474 is the control API: chaos tests create
+  # and destroy proxies and toxics there at test time, so no fault survives past the test
+  # that injected it. 15432 and 16379 are the proxied listeners -- what chaos tests point
+  # their DSN at instead of postgres:5432 / redis:6379 directly.
+  #
+  # The routing is asymmetric on purpose. Toxiproxy's upstream for each proxy is the
+  # in-network address (postgres:5432, redis:6379) -- it reaches the database the same way
+  # every other container does. But tests run on the host, so they reach Toxiproxy itself
+  # through the ports published here (15432, 16379), not through the docker network. A
+  # normal test's DSN (test_database_url, port 5432) and a chaos test's DSN (port 15432)
+  # therefore take physically different paths to the same Postgres -- one direct, one
+  # through the proxy -- which is what lets a toxic on 15432 degrade only the chaos path.
+  #
+  # No proxies are defined here. They are created and destroyed per-test through the
+  # control API, so a stale toxic from one test cannot leak into the next.
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    container_name: sankalp-toxiproxy
+    ports:
+      - "8474:8474"
+      - "15432:15432"
+      - "16379:16379"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+
 volumes:
   pgdata:

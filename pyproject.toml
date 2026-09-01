@@ -51,9 +51,10 @@ asyncio_mode = "auto"
 # Function-scoped event loop: the crash tests run 20x and must not share loop
 # state between repetitions.
 asyncio_default_fixture_loop_scope = "function"
-addopts = "-ra --strict-markers -m 'not slow'"
+addopts = "-ra --strict-markers -m 'not slow and not chaos'"
 markers = [
-    "slow: soak and chaos tests (1000 workflows, worker kills)",
+    "slow: soak tests (1000 workflows, worker kills)",
+    "chaos: Toxiproxy fault-injection scenarios (tests/chaos/test_chaos_*.py) -- need `docker compose up -d toxiproxy`",
 ]
 
 [tool.ruff]

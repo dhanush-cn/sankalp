@@ -2,7 +2,7 @@ PYTHON  ?= python
 COMPOSE ?= docker compose
 
 .DEFAULT_GOAL := help
-.PHONY: help install up down migrate test test-crash test-unwind-crash test-drain-crash test-gates test-soak api worker drain logs psql psql-test clean
+.PHONY: help install up down migrate test test-crash test-unwind-crash test-drain-crash test-gates test-soak chaos api worker drain logs psql psql-test clean
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -36,6 +36,9 @@ test-gates: test-crash test-unwind-crash test-drain-crash ## All three crash gat
 
 test-soak: migrate ## Soak: 1000 workflows with workers being killed
 	SANKALP_ENVIRONMENT=test $(PYTHON) -m pytest -m slow
+
+chaos: migrate ## Chaos suite: Toxiproxy fault injection (needs `docker compose up -d toxiproxy`)
+	SANKALP_ENVIRONMENT=test $(PYTHON) -m pytest tests/chaos/ -m chaos
 
 api: ## Dev API server against the sankalp database
 	$(PYTHON) -m uvicorn sankalp.api.main:app --reload --host 0.0.0.0 --port 8000
