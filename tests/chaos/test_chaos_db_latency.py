@@ -18,25 +18,34 @@ quiescence this test's invariant check depends on). Both point their DB traffic 
 same Toxiproxy Postgres proxy, so one ``latency`` toxic degrades both at once -- the way a real
 `+500ms` on the database would.
 
-Why ``demo_crash`` and not the default workflow_type. ``payment_transfer`` (the default in
+Why ``demo_crash`` *and* ``demo_transfer``, and not the default workflow_type. ``payment_transfer``
+(the default in
 tests/conftest.py's ``insert_workflow``) is registered ad-hoc, inside pytest processes only
 (see tests/test_executor.py) -- a real worker subprocess importing only
 ``sankalp.workflows`` cannot resolve it. ``demo_crash`` is the one production-registered type
 built for exactly this (src/sankalp/workflows/demo.py), submitted here with
 ``{"mode": "sleep", "sleep_seconds": ...}`` -- the default ``mode: "gate"`` would block forever,
-since ``WorkerFleet``'s env arms the crash gate (tests/fleet.py).
+since ``WorkerFleet``'s env arms the crash gate (tests/fleet.py). But ``demo_crash`` alone only
+feeds four of the five invariants. It writes ``side_effects`` (via
+``workflows/_instrumentation.py``, the only ``INSERT INTO side_effects`` in the repo), so it is
+the sole data source for ``check_no_duplicate_side_effects`` -- but it never writes
+``ledger_entries`` or emits ``transfer.posted``, so a run submitting only ``demo_crash`` would
+make ``check_reconciliation`` and ``check_outbox_drained`` pass vacuously, against an empty
+table and an empty outbox. ``demo_transfer`` is the other production-registered type
+(src/sankalp/workflows/transfer.py) and is what actually posts ledger entries and emits
+``transfer.posted``. Submitting both is what makes all five invariants load-bearing in one run.
 
-Known gap, not closed here: reconciliation is vacuous. ``check_all`` (called at the end) still
-runs ``check_reconciliation``, but nothing in ``src/`` writes ``ledger_entries`` for
-``demo_crash`` workflows -- the query runs against an empty table and cannot fail. A green run
-of this scenario is therefore NOT evidence that money balanced under fault; it evidences the
-other four invariants only. Recorded as the third gap in docs/build-log-phase4.md's closing
-"known gaps" section -- see that file for what closing it needs.
+This scenario proves reconciliation under fault, not just in the steady state: transfers posted
+while the database was running +500ms slow still net to zero once the fault clears and every
+workflow reaches a terminal status. That gap closed in commit 085327c (demo_transfer itself) and
+the follow-up that made it emit ``transfer.posted`` -- this scenario is what exercises that path
+under a real latency fault rather than in isolation.
 """
 
 from __future__ import annotations
 
 import asyncio
+import itertools
 import statistics
 import uuid
 from contextlib import suppress
@@ -66,7 +75,24 @@ RECOVERY_SECONDS = 6.0
 #: Ceiling on waiting for every submitted workflow to reach a terminal status once load stops.
 QUIESCENCE_TIMEOUT_SECONDS = 120.0
 
-WORKFLOW_TYPE = "demo_crash"
+#: The two production-registered workflow types this scenario alternates between, each feeding
+#: invariants the other can't -- see the module docstring's "Why demo_crash and demo_transfer"
+#: paragraph.
+SUBMISSION_BODIES: tuple[dict[str, Any], ...] = (
+    {
+        "workflow_type": "demo_crash",
+        "input": {"mode": "sleep", "sleep_seconds": 0.2},
+    },
+    {
+        "workflow_type": "demo_transfer",
+        "input": {
+            "source_account": "acct:chaos-source",
+            "destination_account": "acct:chaos-destination",
+            "amount_minor": 250_00,
+            "currency": "INR",
+        },
+    },
+)
 
 
 async def _submit_loop(
@@ -77,13 +103,12 @@ async def _submit_loop(
     Runs a handful of requests concurrently rather than one at a time, so the limiter sees
     real concurrent admission pressure -- a single in-flight request at a time never contends
     for a permit and the limit would have nothing to shrink against.
+
+    Alternates between ``SUBMISSION_BODIES`` so each batch of four concurrent submissions is
+    half ``demo_crash``, half ``demo_transfer``.
     """
 
-    async def _one_submission(client: httpx.AsyncClient) -> None:
-        body = {
-            "workflow_type": WORKFLOW_TYPE,
-            "input": {"mode": "sleep", "sleep_seconds": 0.2},
-        }
+    async def _one_submission(client: httpx.AsyncClient, body: dict[str, Any]) -> None:
         headers = {"Idempotency-Key": f"chaos-db-latency-{uuid.uuid4().hex}"}
         try:
             response = await client.post(f"{base_url}/workflows", json=body, headers=headers)
@@ -97,9 +122,13 @@ async def _submit_loop(
         # 503 (shed by the limiter) is the mechanism working, not a failure -- deliberately not
         # recorded as an error.
 
+    workflow_cycle = itertools.cycle(SUBMISSION_BODIES)
+
     async with httpx.AsyncClient(timeout=10.0) as client:
         while not stop.is_set():
-            await asyncio.gather(*(_one_submission(client) for _ in range(4)))
+            await asyncio.gather(
+                *(_one_submission(client, next(workflow_cycle)) for _ in range(4))
+            )
             await asyncio.sleep(0.05)
 
 
