@@ -39,20 +39,47 @@ for chaos scenarios would make ``make test-soak`` start collecting them too, dem
 container it never needed. ``pyproject.toml`` registers ``chaos`` alongside ``slow`` and
 excludes both from the default run; ``make chaos`` passes ``-m chaos`` to select exactly the
 scenario files.
+
+An API process, for scenarios that need one. The adaptive concurrency limiter
+(src/sankalp/resilience/adaptive.py) is wired ONLY into the FastAPI ASGI middleware stack
+(src/sankalp/api/main.py, src/sankalp/api/middleware.py) -- a worker fleet never constructs
+one and emits no ``adaptive_concurrency.window_closed`` events. Any chaos scenario that needs
+to observe the limiter (DB latency, in particular) has to run a real API process, which is
+what :class:`ApiProcess` and the :func:`api_process` fixture below are for. Modelled on
+``tests/fleet.py``'s ``WorkerFleet`` -- a real subprocess, logged to a temp file rather than
+``subprocess.PIPE`` (nothing here drains the pipe while the process runs, so a PIPE would fill
+and block the child), with a readiness check that reports a process that died on import as
+that rather than as a mysterious timeout -- and on ``loadtest/scripts/run_scenario.sh``, which
+starts and verifies the same process for the load harness.
 """
 
 from __future__ import annotations
 
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 import pytest
 
 from sankalp.config import get_settings
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: Interpreter boot, imports, DB pool creation, first bind -- generous because a proxied DB
+#: connection (through Toxiproxy, even untoxified) adds a hop over the direct path.
+API_STARTUP_TIMEOUT_SECONDS = 30.0
+API_POLL_SECONDS = 0.1
 
 #: Toxiproxy's control API -- create/list/delete proxies and toxics here.
 TOXIPROXY_CONTROL_URL = "http://localhost:8474"
@@ -160,6 +187,180 @@ async def chaos_proxies(toxiproxy_client: httpx.AsyncClient) -> AsyncIterator[Ch
     finally:
         for name in (PROXY_POSTGRES, PROXY_REDIS):
             await toxiproxy_client.delete(f"/proxies/{name}")
+
+
+def _free_port() -> int:
+    """An unused TCP port on localhost, for the API subprocess to bind.
+
+    Genuinely free at the instant this returns; another process could in principle grab it
+    before ``uvicorn`` binds a moment later. Not worth eliminating: a fixed port would collide
+    with a developer's own ``make api`` running alongside the suite, which is the more likely
+    failure in practice.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+class ApiProcess:
+    """A real ``uvicorn sankalp.api.main:app`` subprocess, and the log tail to explain it.
+
+    Not built on :class:`tests.fleet.WorkerFleet` -- its ``launch`` fixes argv to
+    ``[sys.executable, "-m", module]`` (fleet.py), which has no room for uvicorn's app target
+    and host/port flags. The discipline is copied instead: a temp-file log, a readiness check
+    that fails loudly with the log tail rather than timing out silently, and a kill that only
+    ever touches the pid this object itself spawned.
+    """
+
+    def __init__(self, *, app_dsn: str, extra_env: dict[str, str] | None = None) -> None:
+        self.port = _free_port()
+        self.base_url = f"http://127.0.0.1:{self.port}"
+        handle, path = tempfile.mkstemp(prefix="chaos-api-", suffix=".log")
+        os.close(handle)
+        self.log_path = Path(path)
+        self._env = {
+            **os.environ,
+            # Same reasoning as WorkerFleet._env (fleet.py): a stray env var must not point a
+            # process claiming real work at anything other than sankalp_test.
+            "SANKALP_ENVIRONMENT": "test",
+            "SANKALP_TEST_APP_DATABASE_URL": app_dsn,
+            "SANKALP_LOG_LEVEL": "INFO",
+            # RateLimitMiddleware is the OUTERMOST middleware (api/main.py) -- it would shed
+            # requests before they ever reach AdaptiveConcurrencyMiddleware, starving the very
+            # RTT samples this scenario reads. Disabling it also drops the API's Redis
+            # dependency entirely, which this scenario has no need of.
+            "SANKALP_RATELIMIT_ENABLED": "false",
+            **(extra_env or {}),
+        }
+        self._proc: subprocess.Popen[bytes] | None = None
+
+    def start(self) -> None:
+        handle = self.log_path.open("ab")
+        self._proc = subprocess.Popen(  # noqa: S603 - fixed argv, never shell=True
+            [
+                sys.executable,
+                "-m",
+                "uvicorn",
+                "sankalp.api.main:app",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(self.port),
+            ],
+            env=self._env,
+            cwd=REPO_ROOT,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+        )
+        handle.close()
+        self._await_ready()
+        self._assert_limiter_armed()
+
+    def _await_ready(self) -> None:
+        """Poll ``/openapi.json`` -- pure route/schema introspection, touches no DB pool -- so
+        readiness here proves the ASGI app is serving without depending on the proxied DB.
+        """
+        assert self._proc is not None
+        deadline = time.monotonic() + API_STARTUP_TIMEOUT_SECONDS
+        while True:
+            if self._proc.poll() is not None:
+                raise AssertionError(
+                    f"API process pid {self._proc.pid} exited with {self._proc.returncode} "
+                    f"before it became ready.{self.diagnostics()}"
+                )
+            try:
+                response = httpx.get(f"{self.base_url}/openapi.json", timeout=1.0)
+                if response.status_code == 200:
+                    return
+            except httpx.HTTPError:
+                pass
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"API did not become ready within {API_STARTUP_TIMEOUT_SECONDS:.0f}s."
+                    f"{self.diagnostics()}"
+                )
+            time.sleep(API_POLL_SECONDS)
+
+    def _assert_limiter_armed(self) -> None:
+        """Fail loudly if the adaptive limiter did not actually turn on.
+
+        ``pydantic-settings`` fails silently on a mistyped env var -- it just falls back to the
+        field's default -- so a typo in SANKALP_ADAPTIVE_CONCURRENCY_ENABLED would produce a run
+        that starts fine and measures nothing. Same check loadtest/scripts/run_scenario.sh
+        performs against the same two log lines (api/main.py).
+        """
+        log_text = self._read()
+        if "adaptive concurrency disabled" in log_text:
+            raise AssertionError(
+                "adaptive concurrency is disabled on this API process -- the limit-shrink "
+                f"assertion cannot mean anything.{self.diagnostics()}"
+            )
+        if "adaptive concurrency enabled" not in log_text:
+            raise AssertionError(
+                "did not find the 'adaptive concurrency enabled' startup log line -- cannot "
+                f"confirm the limiter armed.{self.diagnostics()}"
+            )
+
+    def _read(self) -> str:
+        try:
+            return self.log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def diagnostics(self) -> str:
+        if self._proc is None:
+            state = "never started"
+        else:
+            state = "running" if self._proc.poll() is None else f"exited {self._proc.returncode}"
+        tail = "\n".join(self._read().splitlines()[-40:]) or "(no output)"
+        return f"\n--- API process [{state}] ---\n{tail}"
+
+    def stop(self) -> None:
+        if self._proc is None:
+            return
+        if self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait(timeout=10)
+        self.log_path.unlink(missing_ok=True)
+
+
+@pytest.fixture
+async def api_process(chaos_proxies: ChaosProxies) -> AsyncIterator[ApiProcess]:
+    """A running, ready, verified API process whose DB traffic routes through Toxiproxy.
+
+    Stopped in a ``finally`` so a failing test still reaps it -- an API process left running
+    would keep a pool open against the proxy and could confuse the next test's proxy setup.
+    """
+    api = ApiProcess(app_dsn=chaos_proxies.postgres_app_dsn)
+    try:
+        api.start()
+        yield api
+    finally:
+        api.stop()
+
+
+def parse_window_closed(log_path: Path) -> list[dict[str, Any]]:
+    """Every ``adaptive_concurrency.window_closed`` event logged by an :class:`ApiProcess`.
+
+    Delegates to ``loadtest/scripts/parse_adaptive_log.py``'s ``parse_events`` rather than
+    re-implementing the parse: that file is a script, not a package (no ``__init__.py`` under
+    ``loadtest/``), so it is loaded here by file path instead of adding one just to make an
+    import statement work. Its find-the-first-``{`` handling is what recovers the JSON despite
+    ``logging.basicConfig``'s ``"asctime LEVEL name: message"`` prefix (api/main.py) sharing the
+    same file with uvicorn's own access-log lines.
+    """
+    import importlib.util
+
+    script_path = REPO_ROOT / "loadtest" / "scripts" / "parse_adaptive_log.py"
+    spec = importlib.util.spec_from_file_location("parse_adaptive_log", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.parse_events(log_path)
 
 
 # ---------------------------------------------------------------------------
