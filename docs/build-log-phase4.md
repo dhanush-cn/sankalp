@@ -366,3 +366,48 @@ the outbox drain — turned out to be passing against empty tables. Both were fo
 by asking what in `src/` actually writes the table each invariant reads, not by reading the
 invariant's own query. An invariant that has never been seen to fail is not yet a check; the
 other three chaos invariants haven't had this question asked of them yet.
+
+---
+
+## 11. Chaos scenario 1 now alternates `demo_crash` and `demo_transfer`
+
+Sections 9 and 10 gave reconciliation and the outbox drain something real to check, but
+`tests/chaos/test_chaos_db_latency.py` was still submitting only `demo_crash` under the fault.
+Both fixes were dead weight until the scenario actually submitted the workflow type that
+exercises them.
+
+**Why both, not a straight swap.** `demo_crash` is the sole writer of `side_effects` in the
+repo — `workflows/_instrumentation.py` holds the only `INSERT INTO side_effects` — so it alone
+feeds `check_no_duplicate_side_effects`. Replacing it outright with `demo_transfer` would have
+closed two vacuities and opened a third. `demo_transfer` feeds `check_reconciliation` and
+`check_outbox_drained`. Alternating via `itertools.cycle` over a two-element tuple
+(`SUBMISSION_BODIES`) makes each batch of four concurrent submissions exactly 2/2, rather than
+leaving the mix to chance.
+
+**Evidence the alternation actually ran**, queried against `sankalp_test` after a green run: 300
+`demo_crash` workflows in `SUCCESS`, 300 `demo_transfer` workflows in `SUCCESS`, 600
+`ledger_entries` rows (two per transfer), 300 outbox rows all published. This matters because
+`_one_submission` only records an id on a 200/201 response — a rejected `demo_transfer`
+submission (a bad payload, a 503 from the limiter landing disproportionately on one type) would
+have been silently dropped from `submitted`, and the scenario would have gone green with only
+`demo_crash` having actually run, leaving reconciliation vacuous inside the very change meant to
+fix it.
+
+**Revert-proof.** Bypassing the latency toxic (replacing the `async with latency(...):` block
+with a bare `await asyncio.sleep(TOXIC_SECONDS)`) makes the fault-landed guard fail: median RTT
+during the toxic window came back at 0.016s against the 0.25s threshold — a 15x margin. It fails
+on that guard specifically, not on the limit-shrink assertions above it, confirming those would
+otherwise have compared two numbers that never moved rather than catching the fault's absence.
+Reverted immediately after confirming.
+
+**No re-derivation needed for the limit-shrink assertion.** `baseline_ref` is
+`statistics.median` over the baseline windows, and both the "shrinks" and "shrinks by roughly
+half" thresholds in that assertion are relative to it — a changed load profile (two workflow
+types instead of one, different request latencies) moves `baseline_ref` and `during_min`
+together, so the assertion needed no adjustment for the alternation.
+
+**Note for future debugging.** Chaos tests read `ledger_entries` and `outbox` through
+`owning_connection` directly, not through the truncating fixtures `tests/conftest.py` gives
+`pytest`-only tests — so both tables accumulate across chaos runs rather than starting empty
+each time. A reconciliation failure investigated later could involve rows left over from an
+earlier run, not just the run that failed.
